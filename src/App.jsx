@@ -163,6 +163,21 @@ function fmt(n) {
 }
 const sum = arr => arr.reduce((a, e) => a + (+e.amount || 0), 0)
 
+// data locale in formato YYYY-MM-DD (senza problemi di fuso orario)
+const isoDate = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+
+// data di una spesa: usa tx_date se presente, altrimenti la data di creazione
+function txDateOf(e) {
+  if (e.tx_date) { const d = new Date(e.tx_date + 'T00:00:00'); if (!isNaN(d)) return d }
+  if (e.created_at) { const d = new Date(e.created_at); if (!isNaN(d)) return d }
+  return null
+}
+function fmtDate(e) {
+  const d = txDateOf(e)
+  return d ? `${d.getDate()} ${MONTHS_S[d.getMonth()].toLowerCase()}` : ''
+}
+const dateKey = e => (e.tx_date || (e.created_at || '').slice(0, 10) || '')
+
 async function askAI(prompt, maxTokens = 300) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -309,13 +324,16 @@ function Modal({ children, onClose, title }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Form spesa (aggiungi / modifica)
 // ─────────────────────────────────────────────────────────────────────────────
-function ExpenseModal({ cats, initial, onSave, onClose }) {
+function ExpenseModal({ cats, initial, defaultDate, onSave, onClose }) {
   const editing = !!initial?.id
   const [catId, setCatId] = useState(String(initial?.cat_id || initial?.catId || '1'))
   const cat = cats.find(c => c.id === catId) || cats[0]
   const [sub, setSub] = useState(initial?.sub || cat.subs[0] || '')
   const [amount, setAmount] = useState(initial?.amount || '')
   const [note, setNote] = useState(initial?.note || '')
+  const [txDate, setTxDate] = useState(
+    initial?.tx_date || (initial?.created_at ? initial.created_at.slice(0, 10) : '') || defaultDate || isoDate(new Date())
+  )
   const [recurring, setRecurring] = useState(false)
   const [busy, setBusy] = useState(false)
 
@@ -328,7 +346,7 @@ function ExpenseModal({ cats, initial, onSave, onClose }) {
   async function save() {
     if (!amount || +amount <= 0) return
     setBusy(true)
-    await onSave({ id: initial?.id, cat_id: catId, sub, amount: +amount, note, recurring: !editing && recurring })
+    await onSave({ id: initial?.id, cat_id: catId, sub, amount: +amount, note, tx_date: txDate || null, recurring: !editing && recurring })
     setBusy(false)
     onClose()
   }
@@ -343,6 +361,7 @@ function ExpenseModal({ cats, initial, onSave, onClose }) {
       </Select>
       <Field label="Importo (€)" type="number" step="0.01" min="0" inputMode="decimal"
         value={amount} onChange={e => setAmount(e.target.value)} placeholder="0,00" />
+      <Field label="Data" type="date" value={txDate} onChange={e => setTxDate(e.target.value)} />
       <Field label="Note (opzionale)" value={note} onChange={e => setNote(e.target.value)} placeholder="es. cena con amici" />
       {!editing && (
         <div onClick={() => setRecurring(!recurring)} style={{
@@ -373,16 +392,46 @@ function ExpenseModal({ cats, initial, onSave, onClose }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Modal stipendio
 // ─────────────────────────────────────────────────────────────────────────────
-function SalaryModal({ salary, onSave, onClose }) {
+function SalaryModal({ salary, onSave, onClose, onAddExtra }) {
   const [v, setV] = useState(salary || '')
   return (
     <Modal title="Stipendio mensile" onClose={onClose}>
       <div style={{ fontSize: 13.5, color: P.ink3, marginBottom: 14 }}>
-        Il tuo stipendio base. Le entrate extra (bonus, straordinari…) si aggiungono mese per mese dalla sezione Gestione → Entrate.
+        Il tuo stipendio base, uguale ogni mese. Bonus, straordinari e altre entrate una tantum si aggiungono come "entrata extra".
       </div>
       <Field label="Stipendio netto (€ / mese)" type="number" step="1" min="0" inputMode="decimal"
         value={v} onChange={e => setV(e.target.value)} placeholder="1800" />
       <Btn onClick={() => { onSave(+v || 0); onClose() }} style={{ width: '100%' }}>Salva</Btn>
+      <Btn variant="ghost" onClick={() => { onClose(); onAddExtra() }} style={{ width: '100%', marginTop: 10 }}>
+        <Icon name="plus" size={15} color={P.green} /> Aggiungi entrata extra del mese
+      </Btn>
+    </Modal>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Modal entrata extra (Feature 2 — resa più accessibile)
+// ─────────────────────────────────────────────────────────────────────────────
+function IncomeModal({ month, onSave, onClose }) {
+  const [amount, setAmount] = useState('')
+  const [note, setNote] = useState('')
+  const [busy, setBusy] = useState(false)
+  return (
+    <Modal title={`Entrata extra · ${MONTHS[month]}`} onClose={onClose}>
+      <div style={{ fontSize: 13.5, color: P.ink3, marginBottom: 14 }}>
+        Bonus, straordinari, vendite, regali: tutto ciò che incassi <b>oltre lo stipendio</b> in questo mese. Va ad aumentare il budget disponibile.
+      </div>
+      <Field label="Importo (€)" type="number" step="0.01" min="0" inputMode="decimal"
+        value={amount} onChange={e => setAmount(e.target.value)} placeholder="150" autoFocus />
+      <Field label="Descrizione (opzionale)" value={note} onChange={e => setNote(e.target.value)} placeholder="es. straordinari, vendita Vinted…" />
+      <Btn disabled={busy || !amount || +amount <= 0} onClick={async () => {
+        setBusy(true)
+        await onSave(+amount, note)
+        setBusy(false)
+        onClose()
+      }} style={{ width: '100%', background: P.green }}>
+        <Icon name="plus" size={15} color="#fff" /> {busy ? 'Salvataggio…' : 'Aggiungi entrata'}
+      </Btn>
     </Modal>
   )
 }
@@ -673,7 +722,10 @@ function ImportView({ cats, categorizeAI, onImport }) {
         .replace(/\d{1,3}(?:\.\d{3})*,\d{2}/g, '')
         .replace(/\s+/g, ' ').trim()
       if (!desc || !amount || amount <= 0 || +dm[2] < 1 || +dm[2] > 12) continue
-      out.push({ month: +dm[2] - 1, year: yy, desc: desc.slice(0, 90), amount })
+      out.push({
+        month: +dm[2] - 1, year: yy, desc: desc.slice(0, 90), amount,
+        tx_date: `${yy}-${dm[2]}-${dm[1]}`,
+      })
     }
     return out
   }
@@ -722,7 +774,10 @@ function ImportView({ cats, categorizeAI, onImport }) {
         }
       }
       if (date && amount && desc) {
-        out.push({ month: date.getMonth(), year: date.getFullYear(), desc: desc.slice(0, 90), amount })
+        out.push({
+          month: date.getMonth(), year: date.getFullYear(), desc: desc.slice(0, 90), amount,
+          tx_date: isoDate(date),
+        })
       }
     }
     return out
@@ -834,7 +889,7 @@ function ImportView({ cats, categorizeAI, onImport }) {
                     <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 20, background: cat.bg, color: cat.color }}>
                       {cat.name} · {t.sub}
                     </span>
-                    <span style={{ fontSize: 11.5, color: P.ink3 }}>{MONTHS_S[t.month]} {t.year}</span>
+                    <span style={{ fontSize: 11.5, color: P.ink3 }}>{fmtDate(t) || MONTHS_S[t.month].toLowerCase()} {t.year}</span>
                   </div>
                 </div>
                 <span style={{ fontWeight: 700, fontSize: 14.5, letterSpacing: '-0.3px' }}>{fmt(t.amount)}</span>
@@ -897,7 +952,7 @@ function ManageView({
         <>
           <SLabel style={{ marginTop: 6 }}>Spese di {MONTHS[month]}</SLabel>
           {monthExp.length === 0 && <Card style={{ color: P.ink3, fontSize: 13.5, textAlign: 'center' }}>Nessuna spesa questo mese.</Card>}
-          {[...monthExp].sort((a, b) => b.amount - a.amount).map(e => {
+          {[...monthExp].sort((a, b) => dateKey(b).localeCompare(dateKey(a))).map(e => {
             const cat = cats.find(c => c.id === String(e.cat_id)) || cats[0]
             return (
               <Card key={e.id} style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '12px 14px', marginBottom: 8 }}>
@@ -907,7 +962,7 @@ function ManageView({
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 14, fontWeight: 600 }}>{e.sub}</div>
                   <div style={{ fontSize: 12, color: P.ink3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {e.note || cat.name}{e.recurring_id ? ' · ricorrente' : ''}
+                    {fmtDate(e) && `${fmtDate(e)} · `}{e.note || cat.name}{e.recurring_id ? ' · ricorrente' : ''}
                   </div>
                 </div>
                 <span style={{ fontWeight: 700, fontSize: 14.5, letterSpacing: '-0.3px' }}>{fmt(e.amount)}</span>
@@ -1204,6 +1259,7 @@ export default function App() {
   const [view, setView] = useState({ name: 'dash' })
   const [expenseModal, setExpenseModal] = useState(null)
   const [salaryOpen, setSalaryOpen] = useState(false)
+  const [incomeOpen, setIncomeOpen] = useState(false)
   const [report, setReport] = useState(null)
   const [insight, setInsight] = useState(null)
   const [insightGone, setInsightGone] = useState(false)
@@ -1247,9 +1303,13 @@ export default function App() {
     if (missing.length) {
       const rows = missing.map(rc => ({
         user_id: uid, cat_id: String(rc.cat_id), sub: rc.sub, amount: rc.amount,
-        note: rc.note || '', month: M, year: YEAR, recurring_id: rc.id,
+        note: rc.note || '', tx_date: isoDate(now), month: M, year: YEAR, recurring_id: rc.id,
       }))
-      const { data } = await supabase.from('expenses').insert(rows).select()
+      let { data, error } = await supabase.from('expenses').insert(rows).select()
+      if (error && /tx_date/i.test(error.message || '')) {
+        const stripped = rows.map(({ tx_date, ...r }) => r)
+        ;({ data } = await supabase.from('expenses').insert(stripped).select())
+      }
       if (data) setExpenses(prev => [...prev, ...data])
     }
   }
@@ -1370,12 +1430,30 @@ export default function App() {
   // ── CRUD ──
   const uid = session?.user?.id
 
+  // Insert/update con fallback: se la colonna tx_date non esiste ancora nel DB,
+  // riprova senza (l'app resta funzionante anche prima della migration SQL).
+  async function insertExpenseRows(rows) {
+    let { data, error } = await supabase.from('expenses').insert(rows).select()
+    if (error && /tx_date/i.test(error.message || '')) {
+      const stripped = rows.map(({ tx_date, ...r }) => r)
+      ;({ data } = await supabase.from('expenses').insert(stripped).select())
+    }
+    return data
+  }
+
   async function saveExpense(f) {
+    // il mese/anno della spesa seguono la data scelta
+    const d = f.tx_date ? new Date(f.tx_date + 'T00:00:00') : null
+    const expMonth = d && !isNaN(d) ? d.getMonth() : month
+    const expYear = d && !isNaN(d) ? d.getFullYear() : YEAR
     if (f.id) {
-      const { data } = await supabase.from('expenses')
-        .update({ cat_id: f.cat_id, sub: f.sub, amount: f.amount, note: f.note })
-        .eq('id', f.id).select().single()
-      if (data) setExpenses(prev => prev.map(e => e.id === f.id ? data : e))
+      const patch = { cat_id: f.cat_id, sub: f.sub, amount: f.amount, note: f.note, tx_date: f.tx_date, month: expMonth, year: expYear }
+      let { data, error } = await supabase.from('expenses').update(patch).eq('id', f.id).select().single()
+      if (error && /tx_date/i.test(error.message || '')) {
+        const { tx_date, ...stripped } = patch
+        ;({ data } = await supabase.from('expenses').update(stripped).eq('id', f.id).select().single())
+      }
+      if (data) setExpenses(prev => prev.map(e => e.id === f.id ? data : e).filter(e => e.year === YEAR))
     } else {
       let recurringId = null
       if (f.recurring) {
@@ -1384,10 +1462,11 @@ export default function App() {
           .select().single()
         if (rec) { recurringId = rec.id; setRecurring(prev => [...prev, rec]) }
       }
-      const { data } = await supabase.from('expenses')
-        .insert({ user_id: uid, cat_id: f.cat_id, sub: f.sub, amount: f.amount, note: f.note, month, year: YEAR, recurring_id: recurringId })
-        .select().single()
-      if (data) setExpenses(prev => [...prev, data])
+      const data = await insertExpenseRows([{
+        user_id: uid, cat_id: f.cat_id, sub: f.sub, amount: f.amount, note: f.note,
+        tx_date: f.tx_date, month: expMonth, year: expYear, recurring_id: recurringId,
+      }])
+      if (data) setExpenses(prev => [...prev, ...data.filter(e => e.year === YEAR)])
     }
   }
 
@@ -1457,9 +1536,9 @@ export default function App() {
   async function importExpenses(txs) {
     const rows = txs.map(t => ({
       user_id: uid, cat_id: t.catId, sub: t.sub, amount: t.amount,
-      note: t.desc, month: t.month, year: t.year,
+      note: t.desc, tx_date: t.tx_date || null, month: t.month, year: t.year,
     }))
-    const { data } = await supabase.from('expenses').insert(rows).select()
+    const data = await insertExpenseRows(rows)
     if (data) setExpenses(prev => [...prev, ...data.filter(e => e.year === YEAR)])
   }
 
@@ -1616,6 +1695,14 @@ export default function App() {
                     ))}
                   </div>
                 )}
+                <button onClick={() => setIncomeOpen(true)} style={{
+                  width: '100%', marginTop: 12, padding: '10px 12px', borderRadius: 11, cursor: 'pointer',
+                  border: `1.5px dashed ${P.ink4}`, background: 'transparent', color: P.green,
+                  fontSize: 13.5, fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7,
+                  transition: 'all .15s',
+                }}>
+                  <Icon name="plus" size={15} color={P.green} /> Aggiungi entrata extra
+                </button>
               </Card>
 
               {/* Strip obiettivi */}
@@ -1733,7 +1820,7 @@ export default function App() {
                         )}
                       </div>
                       <div style={{ fontSize: 12, color: P.ink3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {e.note || cat.name}
+                        {fmtDate(e) && `${fmtDate(e)} · `}{e.note || cat.name}
                       </div>
                     </div>
                     <span style={{ fontWeight: 700, fontSize: 14.5, letterSpacing: '-0.3px' }}>{fmt(e.amount)}</span>
@@ -1791,7 +1878,7 @@ export default function App() {
                 <Card key={e.id} style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '12px 14px', marginBottom: 8 }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 14, fontWeight: 600 }}>{e.sub}</div>
-                    {e.note && <div style={{ fontSize: 12, color: P.ink3 }}>{e.note}</div>}
+                    <div style={{ fontSize: 12, color: P.ink3 }}>{fmtDate(e)}{e.note ? ` · ${e.note}` : ''}</div>
                   </div>
                   <span style={{ fontWeight: 700, fontSize: 14.5, letterSpacing: '-0.3px' }}>{fmt(e.amount)}</span>
                   <button onClick={() => setExpenseModal({ expense: e })} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4 }}>
@@ -1877,9 +1964,12 @@ export default function App() {
       {/* Modali */}
       {expenseModal && (
         <ExpenseModal cats={cats} initial={expenseModal.expense || (expenseModal.catId ? { catId: expenseModal.catId } : null)}
+          defaultDate={month === now.getMonth() ? isoDate(now) : `${YEAR}-${String(month + 1).padStart(2, '0')}-01`}
           onSave={saveExpense} onClose={() => setExpenseModal(null)} />
       )}
-      {salaryOpen && <SalaryModal salary={salary} onSave={saveSalary} onClose={() => setSalaryOpen(false)} />}
+      {salaryOpen && <SalaryModal salary={salary} onSave={saveSalary} onClose={() => setSalaryOpen(false)}
+        onAddExtra={() => setIncomeOpen(true)} />}
+      {incomeOpen && <IncomeModal month={month} onSave={addIncome} onClose={() => setIncomeOpen(false)} />}
       {report && <ReportModal report={report} onClose={() => setReport(null)} />}
     </div>
   )

@@ -163,6 +163,19 @@ function fmt(n) {
 }
 const sum = arr => arr.reduce((a, e) => a + (+e.amount || 0), 0)
 
+// Importi digitati: accetta virgola o punto come separatore decimale
+// ("15,53" → 15.53, "1.234,56" → 1234.56). NaN se non interpretabile.
+function parseAmount(v) {
+  if (typeof v === 'number') return v
+  const s = String(v ?? '').trim()
+  if (!s) return NaN
+  const norm = s.includes(',') ? s.replace(/\./g, '').replace(',', '.') : s
+  return parseFloat(norm)
+}
+const isPos = v => parseAmount(v) > 0
+const cleanMoney = s => s.replace(/[^\d.,]/g, '')
+const toComma = n => (n == null || n === '') ? '' : String(n).replace('.', ',')
+
 // data locale in formato YYYY-MM-DD (senza problemi di fuso orario)
 const isoDate = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 
@@ -329,7 +342,7 @@ function ExpenseModal({ cats, initial, defaultDate, onSave, onClose }) {
   const [catId, setCatId] = useState(String(initial?.cat_id || initial?.catId || '1'))
   const cat = cats.find(c => c.id === catId) || cats[0]
   const [sub, setSub] = useState(initial?.sub || cat.subs[0] || '')
-  const [amount, setAmount] = useState(initial?.amount || '')
+  const [amount, setAmount] = useState(toComma(initial?.amount ?? ''))
   const [note, setNote] = useState(initial?.note || '')
   const [txDate, setTxDate] = useState(
     initial?.tx_date || (initial?.created_at ? initial.created_at.slice(0, 10) : '') || defaultDate || isoDate(new Date())
@@ -344,9 +357,10 @@ function ExpenseModal({ cats, initial, defaultDate, onSave, onClose }) {
   }
 
   async function save() {
-    if (!amount || +amount <= 0) return
+    const val = parseAmount(amount)
+    if (!(val > 0)) return
     setBusy(true)
-    await onSave({ id: initial?.id, cat_id: catId, sub, amount: +amount, note, tx_date: txDate || null, recurring: !editing && recurring })
+    await onSave({ id: initial?.id, cat_id: catId, sub, amount: val, note, tx_date: txDate || null, recurring: !editing && recurring })
     setBusy(false)
     onClose()
   }
@@ -359,8 +373,8 @@ function ExpenseModal({ cats, initial, defaultDate, onSave, onClose }) {
       <Select label="Sottocategoria" value={sub} onChange={e => setSub(e.target.value)}>
         {(cat.subs.length ? cat.subs : ['Generale']).map(s => <option key={s} value={s}>{s}</option>)}
       </Select>
-      <Field label="Importo (€)" type="number" step="0.01" min="0" inputMode="decimal"
-        value={amount} onChange={e => setAmount(e.target.value)} placeholder="0,00" />
+      <Field label="Importo (€)" type="text" inputMode="decimal"
+        value={amount} onChange={e => setAmount(cleanMoney(e.target.value))} placeholder="0,00" />
       <Field label="Data" type="date" value={txDate} onChange={e => setTxDate(e.target.value)} />
       <Field label="Note (opzionale)" value={note} onChange={e => setNote(e.target.value)} placeholder="es. cena con amici" />
       {!editing && (
@@ -382,7 +396,7 @@ function ExpenseModal({ cats, initial, defaultDate, onSave, onClose }) {
           <Icon name="repeat" size={18} color={recurring ? P.blue : P.ink4} style={{ marginLeft: 'auto' }} />
         </div>
       )}
-      <Btn onClick={save} disabled={busy || !amount} style={{ width: '100%' }}>
+      <Btn onClick={save} disabled={busy || !isPos(amount)} style={{ width: '100%' }}>
         {busy ? 'Salvataggio…' : editing ? 'Salva modifiche' : 'Aggiungi spesa'}
       </Btn>
     </Modal>
@@ -393,15 +407,15 @@ function ExpenseModal({ cats, initial, defaultDate, onSave, onClose }) {
 // Modal stipendio
 // ─────────────────────────────────────────────────────────────────────────────
 function SalaryModal({ salary, onSave, onClose, onAddExtra }) {
-  const [v, setV] = useState(salary || '')
+  const [v, setV] = useState(toComma(salary || ''))
   return (
     <Modal title="Stipendio mensile" onClose={onClose}>
       <div style={{ fontSize: 13.5, color: P.ink3, marginBottom: 14 }}>
         Il tuo stipendio base, uguale ogni mese. Bonus, straordinari e altre entrate una tantum si aggiungono come "entrata extra".
       </div>
-      <Field label="Stipendio netto (€ / mese)" type="number" step="1" min="0" inputMode="decimal"
-        value={v} onChange={e => setV(e.target.value)} placeholder="1800" />
-      <Btn onClick={() => { onSave(+v || 0); onClose() }} style={{ width: '100%' }}>Salva</Btn>
+      <Field label="Stipendio netto (€ / mese)" type="text" inputMode="decimal"
+        value={v} onChange={e => setV(cleanMoney(e.target.value))} placeholder="1800" />
+      <Btn onClick={() => { onSave(parseAmount(v) || 0); onClose() }} style={{ width: '100%' }}>Salva</Btn>
       <Btn variant="ghost" onClick={() => { onClose(); onAddExtra() }} style={{ width: '100%', marginTop: 10 }}>
         <Icon name="plus" size={15} color={P.green} /> Aggiungi entrata extra del mese
       </Btn>
@@ -421,12 +435,12 @@ function IncomeModal({ month, onSave, onClose }) {
       <div style={{ fontSize: 13.5, color: P.ink3, marginBottom: 14 }}>
         Bonus, straordinari, vendite, regali: tutto ciò che incassi <b>oltre lo stipendio</b> in questo mese. Va ad aumentare il budget disponibile.
       </div>
-      <Field label="Importo (€)" type="number" step="0.01" min="0" inputMode="decimal"
-        value={amount} onChange={e => setAmount(e.target.value)} placeholder="150" autoFocus />
+      <Field label="Importo (€)" type="text" inputMode="decimal"
+        value={amount} onChange={e => setAmount(cleanMoney(e.target.value))} placeholder="150" autoFocus />
       <Field label="Descrizione (opzionale)" value={note} onChange={e => setNote(e.target.value)} placeholder="es. straordinari, vendita Vinted…" />
-      <Btn disabled={busy || !amount || +amount <= 0} onClick={async () => {
+      <Btn disabled={busy || !isPos(amount)} onClick={async () => {
         setBusy(true)
-        await onSave(+amount, note)
+        await onSave(parseAmount(amount), note)
         setBusy(false)
         onClose()
       }} style={{ width: '100%', background: P.green }}>
@@ -486,8 +500,8 @@ function ReportModal({ report, onClose }) {
 // Obiettivi (Feature centrale) — vista + flusso creazione AI
 // ─────────────────────────────────────────────────────────────────────────────
 function GoalCard({ g, margin, onUpdateSaved, onDelete }) {
-  const [saved, setSaved] = useState(g.saved)
-  useEffect(() => setSaved(g.saved), [g.saved])
+  const [saved, setSaved] = useState(toComma(g.saved))
+  useEffect(() => setSaved(toComma(g.saved)), [g.saved])
   const now = new Date()
   const d = new Date(g.deadline)
   const monthsLeft = Math.max(0, (d.getFullYear() - now.getFullYear()) * 12 + (d.getMonth() - now.getMonth()))
@@ -534,13 +548,13 @@ function GoalCard({ g, margin, onUpdateSaved, onDelete }) {
       )}
 
       <div style={{ display: 'flex', gap: 8, marginTop: 14, alignItems: 'center' }}>
-        <input type="number" step="1" min="0" inputMode="decimal" value={saved}
-          onChange={e => setSaved(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') onUpdateSaved(g.id, +saved || 0) }}
+        <input type="text" inputMode="decimal" value={saved}
+          onChange={e => setSaved(cleanMoney(e.target.value))}
+          onKeyDown={e => { if (e.key === 'Enter') onUpdateSaved(g.id, parseAmount(saved) || 0) }}
           style={{ ...inputStyle, padding: '8px 10px', fontSize: 14, flex: 1 }}
           onFocus={e => { e.target.style.borderColor = P.blue }}
           onBlur={e => { e.target.style.borderColor = P.ink5 }} />
-        <Btn small variant="ghost" onClick={() => onUpdateSaved(g.id, +saved || 0)}>Aggiorna</Btn>
+        <Btn small variant="ghost" onClick={() => onUpdateSaved(g.id, parseAmount(saved) || 0)}>Aggiorna</Btn>
       </div>
     </Card>
   )
@@ -562,7 +576,7 @@ function GoalsView({ goals, totalIncome, avgSpend, margin, analyzeGoal, onSaveGo
 
   async function accept() {
     await onSaveGoal({
-      name: form.name, icon: form.icon, target: +form.target, saved: +form.saved || 0,
+      name: form.name, icon: form.icon, target: parseAmount(form.target), saved: parseAmount(form.saved) || 0,
       deadline: form.deadline, monthly_ai: result?.mensile ?? null, advice: result?.consiglio ?? null,
     })
     setFlow(null)
@@ -591,8 +605,8 @@ function GoalsView({ goals, totalIncome, avgSpend, margin, analyzeGoal, onSaveGo
             ))}
           </div>
           <Field label="Nome obiettivo" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="es. Viaggio in Giappone" />
-          <Field label="Target (€)" type="number" min="1" inputMode="decimal" value={form.target} onChange={e => setForm({ ...form, target: e.target.value })} placeholder="3000" />
-          <Field label="Già risparmiato (€)" type="number" min="0" inputMode="decimal" value={form.saved} onChange={e => setForm({ ...form, saved: e.target.value })} />
+          <Field label="Target (€)" type="text" inputMode="decimal" value={form.target} onChange={e => setForm({ ...form, target: cleanMoney(e.target.value) })} placeholder="3000" />
+          <Field label="Già risparmiato (€)" type="text" inputMode="decimal" value={form.saved} onChange={e => setForm({ ...form, saved: cleanMoney(e.target.value) })} />
           <Field label="Scadenza" type="date" value={form.deadline} onChange={e => setForm({ ...form, deadline: e.target.value })} />
           <Btn onClick={analyze} disabled={!form.name || !form.target || !form.deadline} style={{ width: '100%' }}>
             <Icon name="spark" size={16} color="#fff" /> Analizza con AI
@@ -1037,13 +1051,13 @@ function ManageView({
           <Card style={{ marginBottom: 12 }}>
             <div style={{ fontSize: 13.5, fontWeight: 600, marginBottom: 10 }}>Aggiungi entrata extra</div>
             <div style={{ display: 'flex', gap: 8 }}>
-              <input type="number" min="0" step="0.01" inputMode="decimal" placeholder="Importo €" value={incAmount}
-                onChange={e => setIncAmount(e.target.value)}
+              <input type="text" inputMode="decimal" placeholder="Importo €" value={incAmount}
+                onChange={e => setIncAmount(cleanMoney(e.target.value))}
                 style={{ ...inputStyle, width: 110, padding: '9px 10px', fontSize: 14 }} />
               <input placeholder="Nota (es. bonus)" value={incNote} onChange={e => setIncNote(e.target.value)}
                 style={{ ...inputStyle, flex: 1, padding: '9px 10px', fontSize: 14 }} />
-              <Btn small disabled={!incAmount || +incAmount <= 0}
-                onClick={() => { onAddIncome(+incAmount, incNote); setIncAmount(''); setIncNote('') }}>
+              <Btn small disabled={!isPos(incAmount)}
+                onClick={() => { onAddIncome(parseAmount(incAmount), incNote); setIncAmount(''); setIncNote('') }}>
                 <Icon name="plus" size={14} color="#fff" />
               </Btn>
             </div>
@@ -1405,7 +1419,7 @@ export default function App() {
   async function analyzeGoal(form) {
     const d = new Date(form.deadline)
     const monthsLeft = Math.max(1, (d.getFullYear() - now.getFullYear()) * 12 + (d.getMonth() - now.getMonth()))
-    const prompt = `${buildContext()}\nMargine mensile stimato (entrate - spesa media): ${Math.round(margin)}€.\nL'utente vuole questo obiettivo: "${form.name}", target ${form.target}€, già risparmiati ${form.saved || 0}€, scadenza ${form.deadline} (${monthsLeft} mesi rimanenti).\nCalcola la quota mensile necessaria (numero). Valuta se è raggiungibile con il margine attuale. Dai UN consiglio specifico e concreto su quale categoria di spesa reale tagliare e di quanto per sostenere il piano (max 40 parole, italiano).\nRispondi SOLO con JSON: {"raggiungibile":true,"mensile":250,"consiglio":"..."}`
+    const prompt = `${buildContext()}\nMargine mensile stimato (entrate - spesa media): ${Math.round(margin)}€.\nL'utente vuole questo obiettivo: "${form.name}", target ${parseAmount(form.target)}€, già risparmiati ${parseAmount(form.saved) || 0}€, scadenza ${form.deadline} (${monthsLeft} mesi rimanenti).\nCalcola la quota mensile necessaria (numero). Valuta se è raggiungibile con il margine attuale. Dai UN consiglio specifico e concreto su quale categoria di spesa reale tagliare e di quanto per sostenere il piano (max 40 parole, italiano).\nRispondi SOLO con JSON: {"raggiungibile":true,"mensile":250,"consiglio":"..."}`
     try { return aiJSON(await askAI(prompt, 400), null) } catch { return null }
   }
 

@@ -186,6 +186,10 @@ const BUCKETS = {
 }
 const BUCKET_KEYS = ['ricorrenti', 'spesa', 'svago']
 
+// colore della linea residuo: verde finché resta ≥80% del budget,
+// arancione man mano che si spende, rosso quando resta ≤20%
+const resColor = pct => pct <= 20 ? '#DC2626' : pct < 80 ? '#D97706' : '#059669'
+
 // esercenti/diciture tipiche di abbonamenti e spese fisse
 const RIC_KEYWORDS = /netflix|spotify|disney|dazn|prime video|amazon prime|now tv|apple\.com|icloud|google one|youtube|playstation|ps plus|xbox|game pass|palestra|gym|mcfit|anytime|basic.?fit|abbonament|canone|iliad|vodafone|tim\b|windtre|wind tre|fastweb|ho\. ?mobile|very mobile|postemobile|assicurazion|mutuo|affitto|rata |leasing|enel|eni plenitude|a2a|hera|iren|edison|luce e gas|fibra|telepass|netflix/i
 
@@ -205,6 +209,22 @@ function bucketOf(e) {
 }
 // chiave "firma" di una spesa per il rilevamento ricorrenti (senza numeri/date)
 const ricKey = e => ((e.note || e.sub || '') + '').toLowerCase().replace(/\d+/g, '').replace(/\s+/g, ' ').trim().slice(0, 40)
+
+// Import: individua le transazioni già registrate nell'app, per non contarle due volte.
+// Due casi: (1) ricorrente auto-inserita dal template a inizio mese che ricompare
+// nell'estratto conto; (2) doppione esatto (stessa data e stesso importo, re-import).
+function markDuplicates(txs, expenses) {
+  return txs.map(t => {
+    const sameMonth = expenses.filter(e => e.month === t.month && e.year === t.year)
+    const tol = Math.max(1, t.amount * 0.02)
+    const ricSignal = t.ric || RIC_KEYWORDS.test(t.desc || '')
+    const auto = sameMonth.find(e => e.recurring_id && Math.abs((+e.amount || 0) - t.amount) <= tol)
+    if (auto && ricSignal) return { ...t, dup: 'ricorrente' }
+    const exact = sameMonth.find(e => Math.abs((+e.amount || 0) - t.amount) < 0.005 && e.tx_date && t.tx_date && e.tx_date === t.tx_date)
+    if (exact) return { ...t, dup: 'doppione' }
+    return t
+  })
+}
 
 // data locale in formato YYYY-MM-DD (senza problemi di fuso orario)
 const isoDate = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
@@ -554,53 +574,92 @@ function ReportModal({ report, onClose }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Piano del mese — l'AI divide le entrate in 4 buste, l'utente conferma/ritocca
+// Piano di gestione — l'utente dichiara il salvadanaio, l'AI analizza il mese
+// scorso e divide il disponibile (entrate − ricorrenti − salvadanaio) tra
+// Spesa e Svago. L'utente conferma o ritocca.
 // ─────────────────────────────────────────────────────────────────────────────
-function PlanModal({ monthName, income, existing, onGenerate, onSave, onClose }) {
-  const empty = { ricorrenti: '', spesa: '', svago: '', salvadanaio: '' }
-  const [phase, setPhase] = useState(existing ? 'edit' : 'loading') // loading | edit | error
-  const [vals, setVals] = useState(existing
-    ? { ricorrenti: toComma(existing.ricorrenti), spesa: toComma(existing.spesa), svago: toComma(existing.svago), salvadanaio: toComma(existing.salvadanaio) }
-    : empty)
+function PlanModal({ monthName, income, estRic, goalHint, existing, onGenerate, onSave, onClose }) {
+  const [salv, setSalv] = useState(toComma(existing?.salvadanaio ?? (goalHint > 0 ? Math.round(goalHint) : '')))
+  const [vals, setVals] = useState(existing ? { spesa: toComma(existing.spesa), svago: toComma(existing.svago) } : { spesa: '', svago: '' })
   const [consiglio, setConsiglio] = useState(existing?.consiglio || '')
+  const [phase, setPhase] = useState(existing ? 'edit' : 'input') // input | loading | edit | error
   const [busy, setBusy] = useState(false)
+
+  const salvN = parseAmount(salv) || 0
+  const disp = income - estRic - salvN          // da dividere tra Spesa e Svago
+  const spesaN = parseAmount(vals.spesa) || 0
+  const svagoN = parseAmount(vals.svago) || 0
+  const resto = disp - spesaN - svagoN
 
   async function generate() {
     setPhase('loading')
-    const r = await onGenerate()
-    if (r && [r.ricorrenti, r.spesa, r.svago, r.salvadanaio].every(v => isFinite(+v))) {
-      setVals({ ricorrenti: toComma(r.ricorrenti), spesa: toComma(r.spesa), svago: toComma(r.svago), salvadanaio: toComma(r.salvadanaio) })
+    const r = await onGenerate(salvN)
+    if (r && isFinite(+r.spesa) && isFinite(+r.svago)) {
+      setVals({ spesa: toComma(Math.round(+r.spesa)), svago: toComma(Math.round(+r.svago)) })
       setConsiglio(r.consiglio || '')
       setPhase('edit')
     } else setPhase('error')
   }
-  useEffect(() => { if (!existing) generate() }, [])
 
-  const tot = BUCKET_KEYS.concat('salvadanaio').reduce((a, k) => a + (parseAmount(vals[k]) || 0), 0)
-  const resto = income - tot
+  const summary = (
+    <div style={{ background: P.ink6, borderRadius: 12, padding: '10px 14px', display: 'flex', justifyContent: 'space-between', marginBottom: 16, fontSize: 12.5, color: P.ink2 }}>
+      <span>Entrate<br /><b style={{ fontSize: 14, color: P.ink }}>{fmt(income)}</b></span>
+      <span style={{ textAlign: 'center' }}>Ricorrenti<br /><b style={{ fontSize: 14, color: P.ink }}>−{fmt(estRic)}</b></span>
+      <span style={{ textAlign: 'center' }}>Salvadanaio<br /><b style={{ fontSize: 14, color: P.ink }}>−{fmt(salvN)}</b></span>
+      <span style={{ textAlign: 'right' }}>Da vivere<br /><b style={{ fontSize: 14, color: disp < 0 ? P.red : P.green }}>{fmt(disp)}</b></span>
+    </div>
+  )
 
   return (
     <Modal title={`Piano di ${monthName}`} onClose={onClose}>
+      {summary}
+
+      {phase === 'input' && (
+        <div>
+          <Field label="Quanto vuoi mettere da parte questo mese? (€)" type="text" inputMode="decimal"
+            value={salv} onChange={e => setSalv(cleanMoney(e.target.value))} placeholder="500" autoFocus />
+          {goalHint > 0 && (
+            <div style={{ fontSize: 12.5, color: P.ink3, margin: '-6px 0 14px' }}>
+              I tuoi obiettivi richiedono circa <b style={{ color: P.ink }}>{fmt(Math.round(goalHint))}/mese</b>.
+            </div>
+          )}
+          {disp < 0 && (
+            <div style={{ background: P.redL, color: P.red, borderRadius: 10, padding: '10px 12px', fontSize: 13, marginBottom: 14, fontWeight: 500 }}>
+              Salvadanaio troppo alto: superi le entrate di {fmt(-disp)}.
+            </div>
+          )}
+          <Btn disabled={disp < 0} onClick={generate} style={{ width: '100%' }}>
+            <Icon name="spark" size={16} color="#fff" /> Analizza il mese scorso con AI
+          </Btn>
+          <Btn variant="ghost" disabled={disp < 0} onClick={() => {
+            const half = Math.max(0, Math.floor(disp / 2))
+            setVals({ spesa: String(half), svago: String(Math.max(0, Math.round(disp - half))) })
+            setPhase('edit')
+          }} style={{ width: '100%', marginTop: 10 }}>
+            Divido io a mano
+          </Btn>
+        </div>
+      )}
+
       {phase === 'loading' && (
         <div style={{ textAlign: 'center', padding: '36px 0', color: P.ink3, fontSize: 14 }}>
           <div className="spin" style={{ width: 28, height: 28, border: `3px solid ${P.ink5}`, borderTopColor: P.blue, borderRadius: '50%', margin: '0 auto 14px' }} />
-          L'AI sta dividendo le tue entrate nelle 4 buste…
+          L'AI sta analizzando il mese scorso…
         </div>
       )}
+
       {phase === 'error' && (
         <div>
           <div style={{ color: P.ink3, fontSize: 14, padding: '16px 0', textAlign: 'center' }}>
-            Non sono riuscito a generare il piano. Verifica la chiave API Anthropic e riprova.
+            Analisi non riuscita. Verifica la chiave API Anthropic e riprova.
           </div>
           <Btn variant="ghost" onClick={generate} style={{ width: '100%' }}>Riprova</Btn>
         </div>
       )}
+
       {phase === 'edit' && (
         <div>
-          <div style={{ fontSize: 13.5, color: P.ink3, marginBottom: 14 }}>
-            Entrate di {monthName}: <b style={{ color: P.ink }}>{fmt(income)}</b>. Ritocca le cifre se vuoi, poi attiva il piano.
-          </div>
-          {BUCKET_KEYS.concat('salvadanaio').map(k => {
+          {[['salvadanaio', salv, v => setSalv(v)], ['spesa', vals.spesa, v => setVals({ ...vals, spesa: v })], ['svago', vals.svago, v => setVals({ ...vals, svago: v })]].map(([k, val, set]) => {
             const b = BUCKETS[k]
             return (
               <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
@@ -608,19 +667,16 @@ function PlanModal({ monthName, income, existing, onGenerate, onSave, onClose })
                   <Icon name={b.icon} size={16} color={b.color} />
                 </div>
                 <div style={{ flex: 1, fontSize: 14, fontWeight: 600 }}>{b.name}</div>
-                <input type="text" inputMode="decimal" value={vals[k]}
-                  onChange={e => setVals({ ...vals, [k]: cleanMoney(e.target.value) })}
+                <input type="text" inputMode="decimal" value={val}
+                  onChange={e => set(cleanMoney(e.target.value))}
                   style={{ ...inputStyle, width: 110, padding: '9px 10px', fontSize: 14, textAlign: 'right' }}
                   onFocus={e => { e.target.style.borderColor = P.blue }}
                   onBlur={e => { e.target.style.borderColor = P.ink5 }} />
               </div>
             )
           })}
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, margin: '12px 2px 14px', color: P.ink3 }}>
-            <span>Totale piano <b style={{ color: P.ink }}>{fmt(tot)}</b></span>
-            <span style={{ color: resto < 0 ? P.red : P.ink3 }}>
-              {resto < 0 ? `Sfori le entrate di ${fmt(-resto)}` : `Non assegnati ${fmt(resto)}`}
-            </span>
+          <div style={{ fontSize: 13, margin: '12px 2px 14px', color: resto < 0 ? P.red : P.ink3, textAlign: 'right' }}>
+            {resto < 0 ? `Sfori il disponibile di ${fmt(-resto)}` : resto > 0 ? `Non assegnati ${fmt(resto)}` : 'Tutto il disponibile è assegnato'}
           </div>
           {consiglio && (
             <div style={{ background: P.blueL, borderRadius: 12, padding: 12, display: 'flex', gap: 9, marginBottom: 14 }}>
@@ -630,18 +686,14 @@ function PlanModal({ monthName, income, existing, onGenerate, onSave, onClose })
           )}
           <Btn disabled={busy || resto < 0} onClick={async () => {
             setBusy(true)
-            const ok = await onSave({
-              ricorrenti: parseAmount(vals.ricorrenti) || 0, spesa: parseAmount(vals.spesa) || 0,
-              svago: parseAmount(vals.svago) || 0, salvadanaio: parseAmount(vals.salvadanaio) || 0,
-              consiglio,
-            })
+            const ok = await onSave({ ricorrenti: estRic, spesa: spesaN, svago: svagoN, salvadanaio: salvN, consiglio })
             setBusy(false)
             if (ok) onClose()
           }} style={{ width: '100%' }}>
             <Icon name="check" size={16} color="#fff" /> {busy ? 'Salvataggio…' : 'Attiva piano'}
           </Btn>
           <Btn variant="ghost" onClick={generate} style={{ width: '100%', marginTop: 10 }}>
-            <Icon name="spark" size={15} color={P.blue} /> Rigenera con AI
+            <Icon name="spark" size={15} color={P.blue} /> Rianalizza con AI
           </Btn>
         </div>
       )}
@@ -921,7 +973,7 @@ function GoalsView({ goals, totalIncome, avgSpend, margin, analyzeGoal, onSaveGo
 // ─────────────────────────────────────────────────────────────────────────────
 // Import estratto conto (7.6)
 // ─────────────────────────────────────────────────────────────────────────────
-function ImportView({ cats, categorizeAI, onImport }) {
+function ImportView({ cats, categorizeAI, onImport, expenses }) {
   const [step, setStep] = useState('pick') // pick | working | review | done | error
   const [workMsg, setWorkMsg] = useState('')
   const [txs, setTxs] = useState([])
@@ -1021,7 +1073,9 @@ function ImportView({ cats, categorizeAI, onImport }) {
       }
       setWorkMsg(`Categorizzazione AI di ${found.length} transazioni…`)
       found = await categorizeAI(found)
-      setTxs(found.map(t => ({ ...t, checked: true })))
+      // riconosci ricorrenti già inserite e doppioni: deselezionali
+      found = markDuplicates(found, expenses)
+      setTxs(found.map(t => ({ ...t, checked: !t.dup })))
       setStep('review')
     } catch (e) {
       setError('Errore durante la lettura del file: ' + (e.message || e))
@@ -1063,7 +1117,7 @@ function ImportView({ cats, categorizeAI, onImport }) {
           </Card>
           <div style={{ display: 'flex', gap: 8, background: P.amberL, borderRadius: 12, padding: 12, marginTop: 12, fontSize: 12.5, color: P.ink2, lineHeight: 1.45 }}>
             <Icon name="info" size={15} color={P.amber} style={{ marginTop: 1 }} />
-            Vengono importate solo le uscite (importi negativi). I PDF scansionati come immagine non sono leggibili: in quel caso usa l'export Excel.
+            Vengono importate solo le uscite (importi negativi). Le spese ricorrenti già registrate dall'app vengono riconosciute e deselezionate, così non le conti due volte. I PDF scansionati come immagine non sono leggibili: in quel caso usa l'export Excel.
           </div>
         </>
       )}
@@ -1087,6 +1141,15 @@ function ImportView({ cats, categorizeAI, onImport }) {
 
       {step === 'review' && (
         <>
+          {txs.some(t => t.dup) && (
+            <div style={{ display: 'flex', gap: 8, background: P.amberL, borderRadius: 12, padding: 12, marginBottom: 10, fontSize: 12.5, color: P.ink2, lineHeight: 1.45 }}>
+              <Icon name="info" size={15} color={P.amber} style={{ marginTop: 1 }} />
+              <span>
+                <b>{txs.filter(t => t.dup).length} {txs.filter(t => t.dup).length === 1 ? 'transazione risulta' : 'transazioni risultano'} già {txs.filter(t => t.dup).length === 1 ? 'registrata' : 'registrate'}</b> (ricorrenti
+                automatiche o doppioni): le ho deselezionate per non contarle due volte.
+              </span>
+            </div>
+          )}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
             <span style={{ fontSize: 13.5, color: P.ink3 }}>{txs.filter(t => t.checked).length} di {txs.length} selezionate</span>
             <Btn small variant="ghost" onClick={() => setTxs(txs.map(t => ({ ...t, checked: !allChecked })))}>
@@ -1111,6 +1174,11 @@ function ImportView({ cats, categorizeAI, onImport }) {
                     <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 20, background: cat.bg, color: cat.color }}>
                       {cat.name} · {t.sub}
                     </span>
+                    {t.dup && (
+                      <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 20, background: P.amberL, color: P.amber, whiteSpace: 'nowrap' }}>
+                        già registrata{t.dup === 'ricorrente' ? ' · ricorrente' : ''}
+                      </span>
+                    )}
                     <span style={{ fontSize: 11.5, color: P.ink3 }}>{fmtDate(t) || MONTHS_S[t.month].toLowerCase()} {t.year}</span>
                   </div>
                 </div>
@@ -1575,6 +1643,46 @@ export default function App() {
     return s
   }, [monthExp])
 
+  // totale spese ricorrenti note (template attivi); fallback: speso ricorrenti del mese scorso
+  const estRic = useMemo(() => {
+    const t = sum(recurring.filter(r => r.active))
+    if (t > 0) return t
+    const pm = now.getMonth() - 1
+    if (pm < 0) return 0
+    return sum(expenses.filter(e => e.month === pm && e.year === YEAR && bucketOf(e) === 'ricorrenti'))
+  }, [recurring, expenses])
+
+  // riporto: i residui (positivi o negativi) di Spesa e Svago dei mesi già
+  // pianificati si trascinano sul mese successivo
+  function carryFor(targetMonth) {
+    const out = { spesa: 0, svago: 0 }
+    const planned = budgets.filter(b => b.year === YEAR && b.month < targetMonth).sort((a, b) => a.month - b.month)
+    for (const b of planned) {
+      const ex = expenses.filter(e => e.month === b.month && e.year === YEAR)
+      const sp = { spesa: 0, svago: 0 }
+      for (const e of ex) { const k = bucketOf(e); if (sp[k] !== undefined) sp[k] += +e.amount || 0 }
+      out.spesa += (+b.spesa || 0) - sp.spesa
+      out.svago += (+b.svago || 0) - sp.svago
+    }
+    return out
+  }
+  const carryover = useMemo(() => carryFor(month), [budgets, expenses, month])
+
+  // rinnovo automatico: a inizio mese copia il piano più recente (il riporto fa il resto)
+  useEffect(() => {
+    if (!loaded || !uid) return
+    const M = now.getMonth()
+    if (budgets.some(b => b.month === M && b.year === YEAR)) return
+    const prev = budgets.filter(b => b.year === YEAR && b.month < M).sort((a, b) => b.month - a.month)[0]
+    if (!prev) return
+    supabase.from('budgets').insert({
+      user_id: uid, month: M, year: YEAR, ricorrenti: prev.ricorrenti, spesa: prev.spesa,
+      svago: prev.svago, salvadanaio: prev.salvadanaio, consiglio: prev.consiglio, salvadanaio_done: false,
+    }).select().single().then(({ data }) => {
+      if (data) setBudgets(p => p.some(b => b.id === data.id) ? p : [...p, data])
+    }).catch(() => { })
+  }, [loaded, budgets])
+
   // quota mensile di un obiettivo (piano AI se c'è, altrimenti calcolo dal residuo)
   function goalQuota(g) {
     if (+g.monthly_ai > 0) return +g.monthly_ai
@@ -1661,13 +1769,16 @@ export default function App() {
     const goalsTxt = goals.length
       ? goals.map(g => `"${g.name}" ${Math.round(g.saved)}/${Math.round(g.target)}€ entro ${g.deadline}${g.monthly_ai ? ` (quota AI ${Math.round(g.monthly_ai)}€/mese)` : ''}`).join('; ')
       : 'nessuno'
-    // piano buste del mese corrente, se attivo
+    // piano di gestione del mese corrente, se attivo (con riporto dai mesi precedenti)
     const bud = budgets.find(b => b.month === M && b.year === YEAR)
-    let bucketTxt = 'Nessun piano buste attivo questo mese.'
+    let bucketTxt = 'Nessun piano di gestione attivo questo mese.'
     if (bud) {
       const sb = { ricorrenti: 0, spesa: 0, svago: 0 }
       for (const e of mExp) sb[bucketOf(e)] += +e.amount || 0
-      bucketTxt = `Piano buste del mese: ricorrenti ${Math.round(sb.ricorrenti)}/${Math.round(bud.ricorrenti)}€, spesa ${Math.round(sb.spesa)}/${Math.round(bud.spesa)}€, svago ${Math.round(sb.svago)}/${Math.round(bud.svago)}€ (speso/budget), salvadanaio ${Math.round(bud.salvadanaio)}€ ${bud.salvadanaio_done ? 'già accantonato' : 'ancora da accantonare'}.`
+      const cf = carryFor(M)
+      const resS = Math.round((+bud.spesa || 0) + cf.spesa - sb.spesa)
+      const resV = Math.round((+bud.svago || 0) + cf.svago - sb.svago)
+      bucketTxt = `Piano di gestione del mese: ricorrenti previste ${Math.round(bud.ricorrenti)}€ (spese finora ${Math.round(sb.ricorrenti)}€); busta Spesa residuo ${resS}€ (budget ${Math.round(bud.spesa)}€${Math.round(cf.spesa) ? `, riporto ${Math.round(cf.spesa)}€` : ''}); busta Svago residuo ${resV}€ (budget ${Math.round(bud.svago)}€${Math.round(cf.svago) ? `, riporto ${Math.round(cf.svago)}€` : ''}); salvadanaio ${Math.round(bud.salvadanaio)}€ ${bud.salvadanaio_done ? 'già accantonato' : 'ancora da accantonare'}.`
     }
     return `Situazione finanziaria dell'utente (oggi è il ${now.getDate()} ${MONTHS[M]} ${YEAR}): entrate del mese ${Math.round(inc)}€, speso finora ${Math.round(sp)}€ (${pct}% delle entrate), spesa media mensile storica ${Math.round(avgSpend)}€. Spese del mese per categoria: ${perCat}. ${bucketTxt} Obiettivi: ${goalsTxt}.`
   }
@@ -1723,34 +1834,28 @@ export default function App() {
     try { return aiJSON(await askAI(prompt, 400), null) } catch { return null }
   }
 
-  // ── AI: piano del mese in 4 buste ──
-  async function generatePlan() {
-    const ricAttive = recurring.filter(r => r.active)
-    const ricTot = sum(ricAttive)
-    const ricTxt = ricAttive.length
-      ? ricAttive.map(r => `${r.note || r.sub} ${Math.round(r.amount)}€`).join(', ')
-      : 'nessuna registrata'
-    // media storica per busta (mesi con spese, anno corrente)
-    const hist = { ricorrenti: [], spesa: [], svago: [] }
-    for (let m = 0; m <= now.getMonth(); m++) {
-      const ex = expenses.filter(e => e.month === m && e.year === YEAR)
-      if (!ex.length) continue
-      const s = { ricorrenti: 0, spesa: 0, svago: 0 }
-      for (const e of ex) s[bucketOf(e)] += +e.amount || 0
-      hist.ricorrenti.push(s.ricorrenti); hist.spesa.push(s.spesa); hist.svago.push(s.svago)
-    }
-    const avg = a => a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length) : 0
-    const goalsTxt = goals.length
-      ? goals.map(g => `"${g.name}" quota ${Math.round(goalQuota(g))}€/mese (scad. ${g.deadline})`).join('; ')
-      : 'nessuno'
+  // ── AI: divide il disponibile (entrate − ricorrenti − salvadanaio) tra Spesa e Svago
+  //    analizzando come l'utente ha speso il mese precedente ──
+  async function generatePlan(salv) {
+    const disp = Math.round(totalIncome - estRic - salv)
+    // analisi del mese precedente rispetto al mese del piano
+    const pm = month - 1
+    const pex = pm >= 0 ? expenses.filter(e => e.month === pm && e.year === YEAR) : []
+    const psp = { ricorrenti: 0, spesa: 0, svago: 0 }
+    for (const e of pex) psp[bucketOf(e)] += +e.amount || 0
+    const svagoDet = cats
+      .map(c => ({ n: c.name, v: sum(pex.filter(e => String(e.cat_id) === c.id && bucketOf(e) === 'svago')) }))
+      .filter(x => x.v > 0).sort((a, b) => b.v - a.v).slice(0, 5)
+      .map(x => `${x.n} ${Math.round(x.v)}€`).join(', ')
+    const prevTxt = pex.length
+      ? `Analisi di ${MONTHS[pm]}: spesa alimentare ${Math.round(psp.spesa)}€, svago ${Math.round(psp.svago)}€ (dettaglio svago: ${svagoDet || 'n/d'}), ricorrenti ${Math.round(psp.ricorrenti)}€.`
+      : 'Nessun dato del mese precedente disponibile.'
     const prompt = `${buildContext()}
-Spese ricorrenti attive note (abbonamenti/fisse): ${ricTxt} — totale ${Math.round(ricTot)}€/mese.
-Media storica mensile per busta: ricorrenti ${avg(hist.ricorrenti)}€, spesa (supermercato) ${avg(hist.spesa)}€, svago ${avg(hist.svago)}€.
-Obiettivi di risparmio: ${goalsTxt} — quota totale consigliata ${Math.round(totGoalQuota)}€/mese.
-Dividi le entrate del mese (${Math.round(totalIncome)}€) in 4 buste di budget: "ricorrenti" (copri almeno le spese fisse note), "spesa" (supermercato/alimentari), "svago" (tutto il resto), "salvadanaio" (quota per gli obiettivi, idealmente ≥ ${Math.round(totGoalQuota)}€ se sostenibile).
-La somma delle 4 buste NON deve superare ${Math.round(totalIncome)}€. Aggiungi UN consiglio pratico (max 30 parole, italiano, tono diretto).
-Rispondi SOLO con JSON: {"ricorrenti":400,"spesa":250,"svago":300,"salvadanaio":550,"consiglio":"..."}`
-    try { return aiJSON(await askAI(prompt, 400), null) } catch { return null }
+${prevTxt}
+L'utente vuole mettere da parte ${Math.round(salv)}€ questo mese. Entrate ${Math.round(totalIncome)}€, spese ricorrenti fisse ${Math.round(estRic)}€: restano ${disp}€ da dividere SOLO tra le buste "spesa" (supermercato/alimentari per casa) e "svago" (tutto il resto: ristoranti, uscite, shopping…).
+Proponi una divisione realistica basata su come ha speso il mese scorso; la somma spesa+svago deve essere ≤ ${disp}. Se il mese scorso ha speso più del disponibile attuale, dillo chiaramente nel consiglio. Aggiungi UN consiglio pratico (max 30 parole, italiano, tono diretto).
+Rispondi SOLO con JSON: {"spesa":300,"svago":300,"consiglio":"..."}`
+    try { return aiJSON(await askAI(prompt, 300), null) } catch { return null }
   }
 
   async function saveBudget(vals) {
@@ -2085,84 +2190,6 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
                 </div>
               )}
 
-              {/* Le 4 buste del mese */}
-              {!curBudget ? (
-                <Card style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 12 }}>
-                  <div style={{ width: 42, height: 42, borderRadius: 12, background: P.blueL, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                    <Icon name="spark" size={20} color={P.blue} />
-                  </div>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontWeight: 700, fontSize: 14.5, letterSpacing: '-0.2px' }}>Crea il piano di {MONTHS[month]}</div>
-                    <div style={{ fontSize: 12.5, color: P.ink3, marginTop: 2 }}>
-                      L'AI divide le entrate in 4 buste in base a spese reali e obiettivi.
-                    </div>
-                  </div>
-                  <Btn small onClick={() => setPlanOpen(true)}>Genera</Btn>
-                </Card>
-              ) : (
-                <>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', margin: '4px 0 8px' }}>
-                    <SLabel style={{ margin: 0 }}>Le tue buste · {MONTHS[month]}</SLabel>
-                    <button onClick={() => setPlanOpen(true)} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4, display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, fontWeight: 600, color: P.blue }}>
-                      <Icon name="pencil" size={13} color={P.blue} /> Piano
-                    </button>
-                  </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 }}>
-                    {BUCKET_KEYS.map(k => {
-                      const b = BUCKETS[k]
-                      const bud = +curBudget[k] || 0
-                      const sp = spentBuckets[k]
-                      const res = bud - sp
-                      const pb = bud > 0 ? Math.min(100, (sp / bud) * 100) : (sp > 0 ? 100 : 0)
-                      const barC = pb > 90 ? P.red : pb > 70 ? P.amber : b.color
-                      return (
-                        <Card key={k} style={{ padding: '12px 14px' }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                            <div style={{ width: 26, height: 26, borderRadius: 8, background: b.bg, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                              <Icon name={b.icon} size={14} color={b.color} />
-                            </div>
-                            <span style={{ fontSize: 12.5, fontWeight: 600, color: P.ink2 }}>{b.name}</span>
-                          </div>
-                          <div style={{ fontSize: 19, fontWeight: 700, letterSpacing: '-0.6px', margin: '8px 0 1px', color: res < 0 ? P.red : P.ink }}>
-                            {fmt(res)}
-                          </div>
-                          <div style={{ fontSize: 11, color: P.ink3 }}>di {fmt(bud)} rimanenti</div>
-                          <div style={{ height: 4, background: P.ink5, borderRadius: 4, marginTop: 8 }}>
-                            <div style={{ height: 4, width: `${pb}%`, background: barC, borderRadius: 4, transition: 'width .3s' }} />
-                          </div>
-                        </Card>
-                      )
-                    })}
-                    {/* Salvadanaio */}
-                    <Card style={{
-                      padding: '12px 14px', gridColumn: '1 / -1',
-                      display: 'flex', alignItems: 'center', gap: 10,
-                      background: curBudget.salvadanaio_done ? P.greenL : P.white,
-                      border: `1px solid ${curBudget.salvadanaio_done ? '#BBE7D4' : P.ink5}`,
-                    }}>
-                      <div style={{ width: 34, height: 34, borderRadius: 10, background: P.blueL, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                        <Icon name="target" size={17} color={P.blue} />
-                      </div>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 12.5, fontWeight: 600, color: P.ink2 }}>Salvadanaio · obiettivi</div>
-                        <div style={{ fontSize: 17, fontWeight: 700, letterSpacing: '-0.5px' }}>{fmt(curBudget.salvadanaio)}</div>
-                      </div>
-                      {curBudget.salvadanaio_done ? (
-                        <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12.5, fontWeight: 600, color: P.green }}>
-                          <Icon name="check" size={15} color={P.green} /> Accantonato
-                        </span>
-                      ) : month === now.getMonth() ? (
-                        <Btn small variant="ghost" onClick={confirmSalvadanaio}>
-                          <Icon name="check" size={14} color={P.green} /> Metti da parte
-                        </Btn>
-                      ) : (
-                        <span style={{ fontSize: 12, color: P.ink3 }}>da accantonare</span>
-                      )}
-                    </Card>
-                  </div>
-                </>
-              )}
-
               {/* Hero card */}
               <Card style={{ padding: 20 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.08em', color: P.ink3 }}>
@@ -2208,9 +2235,125 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
                 </button>
               </Card>
 
-              {/* Strip obiettivi */}
+              {/* Piano di gestione: Spesa, Svago, Salvadanaio — sempre visibile */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', margin: '20px 0 8px' }}>
+                <SLabel style={{ margin: 0 }}>Piano di {MONTHS[month]}</SLabel>
+                {curBudget ? (
+                  <button onClick={() => setPlanOpen(true)} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4, display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, fontWeight: 600, color: P.blue }}>
+                    <Icon name="pencil" size={13} color={P.blue} /> Modifica
+                  </button>
+                ) : (
+                  <Btn small onClick={() => setPlanOpen(true)}>
+                    <Icon name="spark" size={14} color="#fff" /> Crea piano
+                  </Btn>
+                )}
+              </div>
+              {curBudget ? (
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11.5, color: P.ink3, padding: '0 2px', marginBottom: 8 }}>
+                  <span>Entrate <b style={{ color: P.ink }}>{fmt(totalIncome)}</b></span>
+                  <span>Ricorrenti <b style={{ color: spentBuckets.ricorrenti > (+curBudget.ricorrenti || 0) ? P.red : P.ink }}>−{fmt(curBudget.ricorrenti)}</b></span>
+                  <span>Da vivere <b style={{ color: P.ink }}>{fmt(Math.max(0, totalIncome - (+curBudget.ricorrenti || 0) - (+curBudget.salvadanaio || 0)))}</b></span>
+                </div>
+              ) : (
+                <div style={{ fontSize: 12.5, color: P.ink3, margin: '0 2px 8px', lineHeight: 1.45 }}>
+                  Dichiara quanto risparmiare: l'AI analizza il mese scorso e divide il resto tra Spesa e Svago.
+                </div>
+              )}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                {['spesa', 'svago'].map(k => {
+                  const b = BUCKETS[k]
+                  if (!curBudget) {
+                    return (
+                      <Card key={k} onClick={() => setPlanOpen(true)} style={{ padding: '12px 14px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                          <div style={{ width: 26, height: 26, borderRadius: 8, background: b.bg, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                            <Icon name={b.icon} size={14} color={b.color} />
+                          </div>
+                          <span style={{ fontSize: 12.5, fontWeight: 600, color: P.ink2 }}>{b.name}</span>
+                        </div>
+                        <div style={{ fontSize: 19, fontWeight: 700, letterSpacing: '-0.6px', margin: '8px 0 1px', color: P.ink4 }}>— €</div>
+                        <div style={{ fontSize: 11, color: P.ink3 }}>crea il piano per il residuo</div>
+                        <div style={{ height: 5, background: P.ink5, borderRadius: 5, marginTop: 8 }} />
+                      </Card>
+                    )
+                  }
+                  const budTot = (+curBudget[k] || 0) + carryover[k]   // budget + riporto
+                  const res = budTot - spentBuckets[k]
+                  const pb = budTot > 0 ? Math.max(0, Math.min(100, (res / budTot) * 100)) : 0
+                  return (
+                    <Card key={k} style={{ padding: '12px 14px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                        <div style={{ width: 26, height: 26, borderRadius: 8, background: b.bg, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          <Icon name={b.icon} size={14} color={b.color} />
+                        </div>
+                        <span style={{ fontSize: 12.5, fontWeight: 600, color: P.ink2 }}>{b.name}</span>
+                      </div>
+                      <div style={{ fontSize: 19, fontWeight: 700, letterSpacing: '-0.6px', margin: '8px 0 1px', color: res < 0 ? P.red : P.ink }}>
+                        {fmt(res)}
+                      </div>
+                      <div style={{ fontSize: 11, color: P.ink3 }}>
+                        rimanenti di {fmt(budTot)}
+                        {Math.round(carryover[k]) !== 0 && (
+                          <span style={{ color: carryover[k] > 0 ? P.green : P.red, fontWeight: 600 }}>
+                            {' '}({carryover[k] > 0 ? '+' : ''}{fmt(Math.round(carryover[k] * 100) / 100)} riporto)
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ height: 5, background: P.ink5, borderRadius: 5, marginTop: 8 }}>
+                        <div style={{ height: 5, width: `${pb}%`, background: resColor(pb), borderRadius: 5, transition: 'width .3s, background .3s' }} />
+                      </div>
+                    </Card>
+                  )
+                })}
+                {/* Salvadanaio */}
+                {curBudget ? (
+                  <Card style={{
+                    padding: '12px 14px', gridColumn: '1 / -1',
+                    display: 'flex', alignItems: 'center', gap: 10,
+                    background: curBudget.salvadanaio_done ? P.greenL : P.white,
+                    border: `1px solid ${curBudget.salvadanaio_done ? '#BBE7D4' : P.ink5}`,
+                  }}>
+                    <div style={{ width: 34, height: 34, borderRadius: 10, background: P.blueL, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                      <Icon name="target" size={17} color={P.blue} />
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 12.5, fontWeight: 600, color: P.ink2 }}>Salvadanaio · obiettivi</div>
+                      <div style={{ fontSize: 17, fontWeight: 700, letterSpacing: '-0.5px' }}>{fmt(curBudget.salvadanaio)}</div>
+                    </div>
+                    {curBudget.salvadanaio_done ? (
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12.5, fontWeight: 600, color: P.green }}>
+                        <Icon name="check" size={15} color={P.green} /> Accantonato
+                      </span>
+                    ) : month === now.getMonth() ? (
+                      <Btn small variant="ghost" onClick={confirmSalvadanaio}>
+                        <Icon name="check" size={14} color={P.green} /> Metti da parte
+                      </Btn>
+                    ) : (
+                      <span style={{ fontSize: 12, color: P.ink3 }}>da accantonare</span>
+                    )}
+                  </Card>
+                ) : (
+                  <Card onClick={() => setPlanOpen(true)} style={{
+                    padding: '12px 14px', gridColumn: '1 / -1',
+                    display: 'flex', alignItems: 'center', gap: 10,
+                  }}>
+                    <div style={{ width: 34, height: 34, borderRadius: 10, background: P.blueL, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                      <Icon name="target" size={17} color={P.blue} />
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 12.5, fontWeight: 600, color: P.ink2 }}>Salvadanaio · obiettivi</div>
+                      <div style={{ fontSize: 17, fontWeight: 700, letterSpacing: '-0.5px', color: P.ink4 }}>— €</div>
+                    </div>
+                    <span style={{ fontSize: 12, color: P.blue, fontWeight: 600 }}>Crea piano</span>
+                  </Card>
+                )}
+              </div>
+
+              {/* Strip obiettivi — sezione separata dal piano del mese */}
               {goals.length > 0 && (
-                <div className="hscroll" style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                <>
+                  <SLabel>Obiettivi</SLabel>
+                  <div className="hscroll" style={{ display: 'flex', gap: 8 }}>
                   {goals.map(g => {
                     const gp = Math.min(100, g.target > 0 ? (g.saved / g.target) * 100 : 0)
                     return (
@@ -2227,7 +2370,8 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
                       </Card>
                     )
                   })}
-                </div>
+                  </div>
+                </>
               )}
 
               {/* Report on-demand */}
@@ -2407,7 +2551,7 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
 
         {/* ── IMPORT ── */}
         {view.name === 'import' && (
-          <ImportView cats={cats} categorizeAI={categorizeAI} onImport={importExpenses} />
+          <ImportView cats={cats} categorizeAI={categorizeAI} onImport={importExpenses} expenses={expenses} />
         )}
 
         {/* ── GESTIONE ── */}
@@ -2475,7 +2619,8 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
       {incomeOpen && <IncomeModal month={month} onSave={addIncome} onClose={() => setIncomeOpen(false)} />}
       {report && <ReportModal report={report} onClose={() => setReport(null)} />}
       {planOpen && (
-        <PlanModal monthName={MONTHS[month]} income={totalIncome} existing={curBudget}
+        <PlanModal monthName={MONTHS[month]} income={totalIncome} estRic={estRic}
+          goalHint={totGoalQuota} existing={curBudget}
           onGenerate={generatePlan} onSave={saveBudget} onClose={() => setPlanOpen(false)} />
       )}
       {ricOpen && ricCands.length > 0 && (

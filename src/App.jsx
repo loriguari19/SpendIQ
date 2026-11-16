@@ -1,5 +1,9 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
 import { supabase } from './lib/supabase'
+import { callAI, aiJSON, aiErrorText, AIError } from './lib/ai'
+import { pidx, prevPeriod, inPeriod, lastPeriods, avgMonthlySpend } from './lib/period'
+import { BUCKETS, BUCKET_KEYS, guessBucket, bucketOf, spentByBucket, carryFor } from './lib/buckets'
+import { fetchAll, exportUserData } from './lib/db'
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell,
 } from 'recharts'
@@ -150,6 +154,9 @@ const DEFAULT_CATS = [
   { id: '8', name: 'Investimenti', icon: 'invest', color: '#059669', bg: '#ECFDF5', subs: ['ETF', 'Pensione', 'Crypto', 'Emergenza'] },
 ]
 
+// versione dei documenti legali (public/privacy.html, public/termini.html) accettata alla registrazione
+const LEGAL_VERSION = '2026-11-16'
+
 const MONTHS = ['Gennaio', 'Febbraio', 'Marzo', 'Aprile', 'Maggio', 'Giugno', 'Luglio', 'Agosto', 'Settembre', 'Ottobre', 'Novembre', 'Dicembre']
 const MONTHS_S = ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu', 'Lug', 'Ago', 'Set', 'Ott', 'Nov', 'Dic']
 const CAT_COLORS = [
@@ -176,16 +183,6 @@ const isPos = v => parseAmount(v) > 0
 const cleanMoney = s => s.replace(/[^\d.,]/g, '')
 const toComma = n => (n == null || n === '') ? '' : String(n).replace('.', ',')
 
-// ─── Buste di budget ─────────────────────────────────────────────────────────
-// Ogni spesa vive in una di 3 buste; il salvadanaio è la quota per gli obiettivi.
-const BUCKETS = {
-  ricorrenti: { name: 'Ricorrenti', icon: 'repeat', color: '#7C3AED', bg: '#F5F3FF' },
-  spesa: { name: 'Spesa', icon: 'cart', color: '#059669', bg: '#ECFDF5' },
-  svago: { name: 'Svago', icon: 'fun', color: '#D97706', bg: '#FFFBEB' },
-  salvadanaio: { name: 'Salvadanaio', icon: 'target', color: '#2563EB', bg: '#EFF4FF' },
-}
-const BUCKET_KEYS = ['ricorrenti', 'spesa', 'svago']
-
 // colore della linea residuo: verde finché resta ≥80% del budget,
 // arancione man mano che si spende, rosso quando resta ≤20%
 const resColor = pct => pct <= 20 ? '#DC2626' : pct < 80 ? '#D97706' : '#059669'
@@ -193,20 +190,6 @@ const resColor = pct => pct <= 20 ? '#DC2626' : pct < 80 ? '#D97706' : '#059669'
 // esercenti/diciture tipiche di abbonamenti e spese fisse
 const RIC_KEYWORDS = /netflix|spotify|disney|dazn|prime video|amazon prime|now tv|apple\.com|icloud|google one|youtube|playstation|ps plus|xbox|game pass|palestra|gym|mcfit|anytime|basic.?fit|abbonament|canone|iliad|vodafone|tim\b|windtre|wind tre|fastweb|ho\. ?mobile|very mobile|postemobile|assicurazion|mutuo|affitto|rata |leasing|enel|eni plenitude|a2a|hera|iren|edison|luce e gas|fibra|telepass|netflix/i
 
-// sottocategorie di Casa che sono di fatto spese fisse mensili
-const CASA_FISSE = /affitto|mutuo|condominio|utenze|internet/i
-
-// busta suggerita per una spesa (usata anche per le spese vecchie senza colonna bucket)
-function guessBucket(catId, sub, recurring) {
-  if (recurring) return 'ricorrenti'
-  if (String(catId) === '4') return 'spesa'
-  if (String(catId) === '1' && CASA_FISSE.test(sub || '')) return 'ricorrenti'
-  return 'svago'
-}
-function bucketOf(e) {
-  if (e.bucket && BUCKETS[e.bucket]) return e.bucket
-  return guessBucket(e.cat_id, e.sub, !!e.recurring_id)
-}
 // chiave "firma" di una spesa per il rilevamento ricorrenti (senza numeri/date)
 const ricKey = e => ((e.note || e.sub || '') + '').toLowerCase().replace(/\d+/g, '').replace(/\s+/g, ' ').trim().slice(0, 40)
 
@@ -241,57 +224,6 @@ function fmtDate(e) {
 }
 const dateKey = e => (e.tx_date || (e.created_at || '').slice(0, 10) || '')
 
-async function askAI(prompt, maxTokens = 300) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': import.meta.env.VITE_ANTHROPIC_KEY,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true',
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: maxTokens,
-      messages: [{ role: 'user', content: prompt }],
-    }),
-  })
-  const data = await res.json()
-  return data.content?.find(b => b.type === 'text')?.text || ''
-}
-
-async function askAIChat(messages, maxTokens = 300) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': import.meta.env.VITE_ANTHROPIC_KEY,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true',
-    },
-    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: maxTokens, messages }),
-  })
-  const data = await res.json()
-  return data.content?.find(b => b.type === 'text')?.text || ''
-}
-
-function aiJSON(text, fallback) {
-  try { return JSON.parse(text.replace(/```json|```/g, '').trim()) } catch { return fallback }
-}
-
-const loadedScripts = {}
-function loadScript(src) {
-  if (loadedScripts[src]) return loadedScripts[src]
-  loadedScripts[src] = new Promise((resolve, reject) => {
-    const s = document.createElement('script')
-    s.src = src
-    s.onload = resolve
-    s.onerror = () => reject(new Error('Impossibile caricare ' + src))
-    document.head.appendChild(s)
-  })
-  return loadedScripts[src]
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Auth
 // ─────────────────────────────────────────────────────────────────────────────
@@ -301,6 +233,7 @@ function AuthScreen() {
   const [password, setPassword] = useState('')
   const [msg, setMsg] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [accepted, setAccepted] = useState(false)
 
   async function submit(e) {
     e.preventDefault()
@@ -310,7 +243,11 @@ function AuthScreen() {
         const { error } = await supabase.auth.signInWithPassword({ email, password })
         if (error) setMsg({ t: 'err', text: error.message })
       } else {
-        const { error } = await supabase.auth.signUp({ email, password })
+        // l'accettazione di termini e informativa viene registrata nei metadati dell'account
+        const { error } = await supabase.auth.signUp({
+          email, password,
+          options: { data: { terms_accepted_at: new Date().toISOString(), terms_version: LEGAL_VERSION } },
+        })
         if (error) setMsg({ t: 'err', text: error.message })
         else setMsg({ t: 'ok', text: 'Registrazione avvenuta! Controlla la tua email per confermare l\'account.' })
       }
@@ -342,7 +279,17 @@ function AuthScreen() {
                 borderRadius: 10, padding: '10px 12px', fontSize: 13, marginBottom: 14, fontWeight: 500,
               }}>{msg.text}</div>
             )}
-            <Btn type="submit" disabled={busy} style={{ width: '100%' }}>
+            {mode === 'signup' && (
+              <label style={{ display: 'flex', gap: 9, alignItems: 'flex-start', fontSize: 13, color: P.ink2, lineHeight: 1.45, marginBottom: 14, cursor: 'pointer' }}>
+                <input type="checkbox" required checked={accepted} onChange={e => setAccepted(e.target.checked)}
+                  style={{ width: 18, height: 18, marginTop: 1, flexShrink: 0, accentColor: P.blue }} />
+                <span>
+                  Ho letto l'<a href="/privacy.html" target="_blank" rel="noopener" style={{ color: P.blue, fontWeight: 600 }}>informativa privacy</a> e
+                  accetto i <a href="/termini.html" target="_blank" rel="noopener" style={{ color: P.blue, fontWeight: 600 }}>termini d'uso</a>.
+                </span>
+              </label>
+            )}
+            <Btn type="submit" disabled={busy || (mode === 'signup' && !accepted)} style={{ width: '100%' }}>
               {busy ? 'Attendi…' : mode === 'login' ? 'Accedi' : 'Crea account'}
             </Btn>
           </form>
@@ -532,7 +479,7 @@ function IncomeModal({ month, onSave, onClose }) {
 // ─────────────────────────────────────────────────────────────────────────────
 function ReportModal({ report, onClose }) {
   return (
-    <Modal title={`Report di ${MONTHS[report.month]}`} onClose={onClose}>
+    <Modal title={`Report di ${MONTHS[report.month]} ${report.year}`} onClose={onClose}>
       {report.loading ? (
         <div style={{ textAlign: 'center', padding: '36px 0', color: P.ink3, fontSize: 14 }}>
           <div className="spin" style={{
@@ -543,7 +490,7 @@ function ReportModal({ report, onClose }) {
         </div>
       ) : !report.data ? (
         <div style={{ color: P.ink3, fontSize: 14, padding: '20px 0', textAlign: 'center' }}>
-          Impossibile generare il report. Verifica la chiave API Anthropic e riprova.
+          {report.error || 'Impossibile generare il report in questo momento. Riprova tra poco.'}
         </div>
       ) : (
         <div>
@@ -651,9 +598,10 @@ function PlanModal({ monthName, income, estRic, goalHint, existing, onGenerate, 
       {phase === 'error' && (
         <div>
           <div style={{ color: P.ink3, fontSize: 14, padding: '16px 0', textAlign: 'center' }}>
-            Analisi non riuscita. Verifica la chiave API Anthropic e riprova.
+            Analisi non riuscita: il coach AI non è disponibile in questo momento. Riprova tra poco oppure dividi a mano.
           </div>
           <Btn variant="ghost" onClick={generate} style={{ width: '100%' }}>Riprova</Btn>
+          <Btn variant="ghost" onClick={() => setPhase('input')} style={{ width: '100%', marginTop: 10 }}>Indietro</Btn>
         </div>
       )}
 
@@ -900,7 +848,7 @@ function GoalsView({ goals, totalIncome, avgSpend, margin, analyzeGoal, onSaveGo
         {!result ? (
           <Card>
             <div style={{ fontSize: 14, color: P.ink3, textAlign: 'center', padding: '16px 0' }}>
-              Analisi non riuscita. Verifica la chiave API Anthropic e riprova.
+              Analisi non riuscita: il coach AI non è disponibile in questo momento. Riprova tra poco.
             </div>
           </Card>
         ) : (
@@ -1006,9 +954,14 @@ function ImportView({ cats, categorizeAI, onImport, expenses }) {
 
   async function parsePDF(file) {
     setWorkMsg('Lettura del PDF…')
-    await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js')
-    window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
-    const pdf = await window.pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise
+    // pdf.js arriva da npm (versione fissata nel lockfile) ed è caricato solo quando serve.
+    // Build "legacy" per compatibilità con i browser mobile meno recenti.
+    const [pdfjs, worker] = await Promise.all([
+      import('pdfjs-dist/legacy/build/pdf.mjs'),
+      import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'),
+    ])
+    pdfjs.GlobalWorkerOptions.workerSrc = worker.default
+    const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise
     const lines = []
     for (let p = 1; p <= pdf.numPages; p++) {
       const page = await pdf.getPage(p)
@@ -1028,9 +981,9 @@ function ImportView({ cats, categorizeAI, onImport, expenses }) {
 
   async function parseXLSX(file) {
     setWorkMsg('Lettura del file Excel…')
-    await loadScript('https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js')
-    const wb = window.XLSX.read(await file.arrayBuffer(), { cellDates: true })
-    const rows = window.XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1 })
+    const XLSX = await import('xlsx')
+    const wb = XLSX.read(await file.arrayBuffer(), { cellDates: true })
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1 })
     const out = []
     for (const r of rows) {
       if (!Array.isArray(r)) continue
@@ -1078,7 +1031,7 @@ function ImportView({ cats, categorizeAI, onImport, expenses }) {
       setTxs(found.map(t => ({ ...t, checked: !t.dup })))
       setStep('review')
     } catch (e) {
-      setError('Errore durante la lettura del file: ' + (e.message || e))
+      setError(e instanceof AIError ? e.message : 'Errore durante la lettura del file: ' + (e.message || e))
       setStep('error')
     }
   }
@@ -1210,10 +1163,153 @@ function ImportView({ cats, categorizeAI, onImport, expenses }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Gestione (7.8) — 4 tab
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Consenso al coach AI — spiega cosa viene inviato e a chi, prima di attivarlo
+// ─────────────────────────────────────────────────────────────────────────────
+function AIConsentModal({ onAccept, onClose }) {
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  return (
+    <Modal title="Attiva il coach AI" onClose={onClose}>
+      <div style={{ fontSize: 14, color: P.ink2, lineHeight: 1.55 }}>
+        Il coach AI analizza i tuoi numeri per darti insight, report, piani e risposte in chat.
+        Per farlo, SpendIQ invia ad <b>Anthropic</b> (fornitore del modello AI, con sede negli Stati Uniti):
+        <ul style={{ margin: '10px 0', paddingLeft: 20 }}>
+          <li>i totali di entrate e spese e il piano del mese;</li>
+          <li>nomi, importi e scadenze dei tuoi obiettivi;</li>
+          <li>le descrizioni delle transazioni che importi, per categorizzarle;</li>
+          <li>i messaggi che scrivi in chat.</li>
+        </ul>
+        Non vengono inviati email, password o dati di accesso. Puoi disattivare il coach in qualsiasi
+        momento da <b>Gestione → Account</b>; senza coach l'app continua a funzionare, ma senza funzioni AI.
+        Dettagli nell'<a href="/privacy.html" target="_blank" rel="noopener" style={{ color: P.blue, fontWeight: 600 }}>informativa privacy</a>.
+      </div>
+      <div style={{ background: P.amberL, borderRadius: 12, padding: 12, margin: '14px 0', fontSize: 13, color: P.ink2, lineHeight: 1.45 }}>
+        Il coach dà indicazioni generali di gestione del budget. <b>Non è consulenza finanziaria</b>, fiscale o in materia di investimenti.
+      </div>
+      {err && (
+        <div style={{ background: P.redL, color: P.red, borderRadius: 10, padding: '10px 12px', fontSize: 13, marginBottom: 14, fontWeight: 500 }}>{err}</div>
+      )}
+      <Btn disabled={busy} onClick={async () => {
+        setBusy(true); setErr('')
+        try { await onAccept(); onClose() } catch { setErr('Non sono riuscito ad attivare il coach. Riprova tra poco.') }
+        setBusy(false)
+      }} style={{ width: '100%' }}>
+        <Icon name="spark" size={16} color="#fff" /> {busy ? 'Attivazione…' : 'Acconsento e attivo il coach'}
+      </Btn>
+      <Btn variant="ghost" onClick={onClose} style={{ width: '100%', marginTop: 10 }}>Non ora</Btn>
+    </Modal>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Account — consenso AI, esportazione dati, documenti legali, eliminazione account
+// ─────────────────────────────────────────────────────────────────────────────
+function AccountTab({ email, aiConsent, onEnableAI, onDisableAI, onExport, onDeleteAccount, onLogout }) {
+  const [busy, setBusy] = useState('') // '' | 'ai' | 'export' | 'delete'
+  const [msg, setMsg] = useState(null)
+  const [delOpen, setDelOpen] = useState(false)
+  const [confirmText, setConfirmText] = useState('')
+
+  async function run(kind, fn, okText) {
+    setBusy(kind); setMsg(null)
+    try {
+      await fn()
+      if (okText) setMsg({ t: 'ok', text: okText })
+    } catch (e) {
+      setMsg({ t: 'err', text: e?.userMessage || 'Operazione non riuscita. Controlla la connessione e riprova.' })
+    }
+    setBusy('')
+  }
+
+  return (
+    <>
+      <SLabel style={{ marginTop: 6 }}>Account</SLabel>
+      <Card style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 12.5, color: P.ink3 }}>Hai effettuato l'accesso come</div>
+        <div style={{ fontSize: 15, fontWeight: 600, marginTop: 2, wordBreak: 'break-all' }}>{email}</div>
+        <Btn small variant="ghost" onClick={onLogout} style={{ marginTop: 12 }}>
+          <Icon name="logout" size={14} /> Esci
+        </Btn>
+      </Card>
+
+      {msg && (
+        <div role="status" style={{
+          background: msg.t === 'err' ? P.redL : P.greenL, color: msg.t === 'err' ? P.red : P.green,
+          borderRadius: 10, padding: '10px 12px', fontSize: 13, marginBottom: 12, fontWeight: 500,
+        }}>{msg.text}</div>
+      )}
+
+      <Card style={{ marginBottom: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <Icon name="spark" size={18} color={aiConsent ? P.blue : P.ink4} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 14.5, fontWeight: 600 }}>Coach AI</div>
+            <div style={{ fontSize: 12.5, color: P.ink3 }}>{aiConsent ? 'Attivo' : 'Non attivo'}</div>
+          </div>
+          {aiConsent ? (
+            <Btn small variant="ghost" disabled={busy === 'ai'} onClick={() => run('ai', onDisableAI, 'Coach AI disattivato: i tuoi dati non vengono più inviati al fornitore AI.')}>
+              Disattiva
+            </Btn>
+          ) : (
+            <Btn small onClick={onEnableAI}>Attiva</Btn>
+          )}
+        </div>
+        <div style={{ fontSize: 12.5, color: P.ink3, marginTop: 10, lineHeight: 1.45 }}>
+          Con il coach attivo, i dati necessari a insight, report, piani e chat vengono inviati ad Anthropic.
+          Il coach non offre consulenza finanziaria.
+        </div>
+      </Card>
+
+      <Card style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 14.5, fontWeight: 600 }}>I tuoi dati</div>
+        <div style={{ fontSize: 12.5, color: P.ink3, margin: '4px 0 12px', lineHeight: 1.45 }}>
+          Scarica una copia completa di spese, entrate, obiettivi, piani, categorie e ricorrenti in formato JSON.
+        </div>
+        <Btn small variant="ghost" disabled={busy === 'export'} onClick={() => run('export', onExport, 'Esportazione scaricata.')}>
+          <Icon name="upload" size={14} style={{ transform: 'rotate(180deg)' }} /> {busy === 'export' ? 'Preparazione…' : 'Esporta i miei dati'}
+        </Btn>
+        <div style={{ display: 'flex', gap: 16, marginTop: 14, fontSize: 13 }}>
+          <a href="/privacy.html" target="_blank" rel="noopener" style={{ color: P.blue, fontWeight: 600 }}>Informativa privacy</a>
+          <a href="/termini.html" target="_blank" rel="noopener" style={{ color: P.blue, fontWeight: 600 }}>Termini d'uso</a>
+        </div>
+      </Card>
+
+      <Card style={{ marginBottom: 12, border: `1px solid #F5C6C6` }}>
+        <div style={{ fontSize: 14.5, fontWeight: 600, color: P.red }}>Elimina account</div>
+        <div style={{ fontSize: 12.5, color: P.ink3, margin: '4px 0 12px', lineHeight: 1.45 }}>
+          Cancella definitivamente l'account e tutti i dati collegati. L'operazione non si può annullare:
+          se vuoi conservarne una copia, esporta prima i tuoi dati.
+        </div>
+        {!delOpen ? (
+          <Btn small variant="danger" onClick={() => setDelOpen(true)}>
+            <Icon name="trash" size={14} color={P.red} /> Elimina il mio account
+          </Btn>
+        ) : (
+          <>
+            <label htmlFor="del-confirm" style={labelStyle}>Scrivi ELIMINA per confermare</label>
+            <input id="del-confirm" value={confirmText} onChange={e => setConfirmText(e.target.value)}
+              autoComplete="off" autoCapitalize="characters"
+              style={{ ...inputStyle, marginBottom: 12 }} />
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Btn small variant="ghost" onClick={() => { setDelOpen(false); setConfirmText('') }} style={{ flex: 1 }}>Annulla</Btn>
+              <Btn small color={P.red} disabled={busy === 'delete' || confirmText.trim() !== 'ELIMINA'}
+                onClick={() => run('delete', onDeleteAccount)} style={{ flex: 1 }}>
+                {busy === 'delete' ? 'Eliminazione…' : 'Elimina definitivamente'}
+              </Btn>
+            </div>
+          </>
+        )}
+      </Card>
+    </>
+  )
+}
+
 function ManageView({
-  cats, customCats, monthExp, month, recurring, incomes, monthIncomes, salary, totalIncome,
+  cats, customCats, monthExp, month, year, recurring, incomes, monthIncomes, salary, totalIncome,
   onEditExpense, onDeleteExpense, onToggleRecurring, onDeleteRecurring,
   onAddIncome, onDeleteIncome, onAddCategory, onDeleteCategory, onUpdateCatSubs, onOpenSalary,
+  account,
 }) {
   const [tab, setTab] = useState('spese')
   const [incAmount, setIncAmount] = useState('')
@@ -1223,7 +1319,7 @@ function ManageView({
   const [catSubs, setCatSubs] = useState('')
   const [newSub, setNewSub] = useState({})
 
-  const TABS = [['spese', 'Spese'], ['ricorrenti', 'Ricorrenti'], ['entrate', 'Entrate'], ['categorie', 'Categorie']]
+  const TABS = [['spese', 'Spese'], ['ricorrenti', 'Ricorrenti'], ['entrate', 'Entrate'], ['categorie', 'Categorie'], ['account', 'Account']]
 
   return (
     <div className="fadeUp" style={{ padding: '0 16px' }}>
@@ -1240,7 +1336,7 @@ function ManageView({
 
       {tab === 'spese' && (
         <>
-          <SLabel style={{ marginTop: 6 }}>Spese di {MONTHS[month]}</SLabel>
+          <SLabel style={{ marginTop: 6 }}>Spese di {MONTHS[month]} {year}</SLabel>
           {monthExp.length === 0 && <Card style={{ color: P.ink3, fontSize: 13.5, textAlign: 'center' }}>Nessuna spesa questo mese.</Card>}
           {[...monthExp].sort((a, b) => dateKey(b).localeCompare(dateKey(a))).map(e => {
             const cat = cats.find(c => c.id === String(e.cat_id)) || cats[0]
@@ -1308,7 +1404,7 @@ function ManageView({
 
       {tab === 'entrate' && (
         <>
-          <SLabel style={{ marginTop: 6 }}>Entrate di {MONTHS[month]}</SLabel>
+          <SLabel style={{ marginTop: 6 }}>Entrate di {MONTHS[month]} {year}</SLabel>
           <Card style={{ marginBottom: 12 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div>
@@ -1429,6 +1525,8 @@ function ManageView({
           ))}
         </>
       )}
+
+      {tab === 'account' && <AccountTab {...account} />}
     </div>
   )
 }
@@ -1436,9 +1534,9 @@ function ManageView({
 // ─────────────────────────────────────────────────────────────────────────────
 // AI Coach Chat (7.7)
 // ─────────────────────────────────────────────────────────────────────────────
-function ChatPanel({ open, onClose, buildContext }) {
+function ChatPanel({ open, onClose, buildContext, ask }) {
   const [messages, setMessages] = useState([
-    { role: 'assistant', text: 'Ciao! Sono il tuo coach finanziario. Chiedimi qualsiasi cosa sui tuoi soldi.' },
+    { role: 'assistant', text: 'Ciao! Sono il coach AI di SpendIQ. Chiedimi delle tue spese, del piano del mese o dei tuoi obiettivi. Ti do indicazioni generali sul budget, non consulenza finanziaria o sugli investimenti.' },
   ])
   const [input, setInput] = useState('')
   const [typing, setTyping] = useState(false)
@@ -1456,17 +1554,18 @@ function ChatPanel({ open, onClose, buildContext }) {
     setMessages(history)
     setTyping(true)
     try {
-      const apiMsgs = history.slice(-9).map((m, i, arr) => ({
+      const apiMsgs = history.filter(m => !m.error).slice(-9).map((m, i, arr) => ({
         role: m.role === 'user' ? 'user' : 'assistant',
         content: i === arr.length - 1
           ? `${buildContext()}\n\nDomanda dell'utente: ${m.text}\n\nRispondi in italiano, massimo 2 frasi, tono diretto da coach finanziario.`
           : m.text,
       }))
       if (apiMsgs[0]?.role !== 'user') apiMsgs.shift()
-      const reply = await askAIChat(apiMsgs, 200)
-      setMessages(prev => [...prev, { role: 'assistant', text: reply || 'Non sono riuscito a rispondere, riprova.' }])
-    } catch {
-      setMessages(prev => [...prev, { role: 'assistant', text: 'Errore di connessione all\'AI. Verifica la chiave API.' }])
+      const reply = await ask('chat', apiMsgs)
+      setMessages(prev => [...prev, { role: 'assistant', text: reply || 'Su questo non riesco a risponderti. Prova a riformulare la domanda.' }])
+    } catch (e) {
+      // i messaggi d'errore non entrano nella cronologia inviata al modello
+      setMessages(prev => [...prev, { role: 'assistant', text: aiErrorText(e), error: true }])
     }
     setTyping(false)
   }
@@ -1488,7 +1587,7 @@ function ChatPanel({ open, onClose, buildContext }) {
           </div>
           <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 700, fontSize: 14.5, letterSpacing: '-0.2px' }}>AI Coach</div>
-            <div style={{ fontSize: 11.5, color: P.green, fontWeight: 500 }}>conosce le tue finanze</div>
+            <div style={{ fontSize: 11.5, color: P.ink3, fontWeight: 500 }}>Indicazioni generali, non consulenza finanziaria</div>
           </div>
           <button onClick={onClose} style={{ background: P.ink6, border: 'none', borderRadius: 10, width: 30, height: 30, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <Icon name="x" size={15} />
@@ -1546,7 +1645,12 @@ export default function App() {
   const [customCats, setCustomCats] = useState([])
   const [budgets, setBudgets] = useState([])
 
+  // periodo visualizzato: mese + anno (YEAR resta "l'anno di oggi")
   const [month, setMonth] = useState(now.getMonth())
+  const [selYear, setSelYear] = useState(YEAR)
+  const [loadError, setLoadError] = useState(false)
+  const [aiConsent, setAiConsent] = useState(false)
+  const [consentOpen, setConsentOpen] = useState(false)
   const [view, setView] = useState({ name: 'dash' })
   const [expenseModal, setExpenseModal] = useState(null)
   const [salaryOpen, setSalaryOpen] = useState(false)
@@ -1575,25 +1679,38 @@ export default function App() {
 
   // ── Dati ──
   async function loadAll(uid) {
-    const [p, e, g, c, i, r, b] = await Promise.all([
-      supabase.from('profiles').select('*').eq('id', uid).maybeSingle(),
-      supabase.from('expenses').select('*').eq('year', YEAR),
-      supabase.from('goals').select('*').order('created_at'),
-      supabase.from('categories').select('*').order('created_at'),
-      supabase.from('incomes').select('*').eq('year', YEAR),
-      supabase.from('recurring').select('*').order('created_at'),
-      supabase.from('budgets').select('*').eq('year', YEAR),
-    ])
-    setSalary(+(p.data?.salary) || 0)
-    const exps = e.data || []
-    const recs = r.data || []
-    setExpenses(exps)
-    setGoals(g.data || [])
-    setCustomCats(c.data || [])
-    setIncomes(i.data || [])
-    setRecurring(recs)
-    setBudgets(b.data || [])
-    setLoaded(true)
+    setLoadError(false)
+    let exps, recs
+    try {
+      // Tutto lo storico dell'utente, senza filtro sull'anno e paginato oltre le 1000 righe.
+      // Se una lettura fallisce ci si ferma: proseguire con dati vuoti farebbe reinserire
+      // le ricorrenti e mostrerebbe un'app "vuota" per un semplice errore di rete.
+      const [p, e, g, c, i, r, b] = await Promise.all([
+        supabase.from('profiles').select('*').eq('id', uid).maybeSingle(),
+        fetchAll('expenses'), fetchAll('goals'), fetchAll('categories'),
+        fetchAll('incomes'), fetchAll('recurring'),
+        // la tabella budgets nasce con migration-buckets.sql: se manca, l'app funziona senza piani
+        fetchAll('budgets').catch(err => {
+          if (err?.code === '42P01' || err?.code === 'PGRST205') return []
+          throw err
+        }),
+      ])
+      if (p.error) throw p.error
+      exps = e; recs = r
+      setSalary(+(p.data?.salary) || 0)
+      setAiConsent(!!p.data?.ai_consent_at)
+      setExpenses(e)
+      setGoals(g)
+      setCustomCats(c)
+      setIncomes(i)
+      setRecurring(r)
+      setBudgets(b)
+      setLoaded(true)
+    } catch (err) {
+      console.error('Caricamento dati non riuscito', err)
+      setLoadError(true)
+      return
+    }
     // Feature 4 — applica le ricorrenti attive al mese corrente (dedup via recurring_id)
     const M = now.getMonth()
     const missing = recs.filter(rc => rc.active && !exps.some(x => x.recurring_id === rc.id && x.month === M && x.year === YEAR))
@@ -1614,21 +1731,15 @@ export default function App() {
     ...customCats.map(c => ({ ...c, id: String(c.id), icon: c.icon && PATHS[c.icon] ? c.icon : 'tag', subs: c.subs || [] })),
   ], [customCats])
 
-  const monthExp = useMemo(() => expenses.filter(e => e.month === month && e.year === YEAR), [expenses, month])
+  const monthExp = useMemo(() => inPeriod(expenses, selYear, month), [expenses, month, selYear])
   const spent = useMemo(() => sum(monthExp), [monthExp])
-  const monthIncomes = useMemo(() => incomes.filter(i => i.month === month && i.year === YEAR), [incomes, month])
+  const monthIncomes = useMemo(() => inPeriod(incomes, selYear, month), [incomes, month, selYear])
   const totalIncome = salary + sum(monthIncomes)
 
-  const avgSpend = useMemo(() => {
-    const totals = []
-    for (let m = 0; m <= now.getMonth(); m++) {
-      const t = sum(expenses.filter(e => e.month === m && e.year === YEAR))
-      if (t > 0) totals.push(t)
-    }
-    return totals.length ? totals.reduce((a, b) => a + b, 0) / totals.length : 0
-  }, [expenses])
+  // media sugli ultimi 12 mesi (non sull'anno solare): a gennaio non si azzera
+  const avgSpend = useMemo(() => avgMonthlySpend(expenses, YEAR, now.getMonth()), [expenses])
 
-  const curIncome = salary + sum(incomes.filter(i => i.month === now.getMonth() && i.year === YEAR))
+  const curIncome = salary + sum(inPeriod(incomes, YEAR, now.getMonth()))
   const margin = curIncome - avgSpend
 
   const byCat = useMemo(() => cats.map(c => ({
@@ -1636,44 +1747,29 @@ export default function App() {
   })), [cats, monthExp])
 
   // ── Buste: piano del mese visualizzato + speso per busta ──
-  const curBudget = useMemo(() => budgets.find(b => b.month === month && b.year === YEAR) || null, [budgets, month])
-  const spentBuckets = useMemo(() => {
-    const s = { ricorrenti: 0, spesa: 0, svago: 0 }
-    for (const e of monthExp) s[bucketOf(e)] += +e.amount || 0
-    return s
-  }, [monthExp])
+  const curBudget = useMemo(() => budgets.find(b => b.month === month && b.year === selYear) || null, [budgets, month, selYear])
+  const spentBuckets = useMemo(() => spentByBucket(monthExp), [monthExp])
 
   // totale spese ricorrenti note (template attivi); fallback: speso ricorrenti del mese scorso
   const estRic = useMemo(() => {
     const t = sum(recurring.filter(r => r.active))
     if (t > 0) return t
-    const pm = now.getMonth() - 1
-    if (pm < 0) return 0
-    return sum(expenses.filter(e => e.month === pm && e.year === YEAR && bucketOf(e) === 'ricorrenti'))
+    const pp = prevPeriod(YEAR, now.getMonth())
+    return sum(inPeriod(expenses, pp.year, pp.month).filter(e => bucketOf(e) === 'ricorrenti'))
   }, [recurring, expenses])
 
   // riporto: i residui (positivi o negativi) di Spesa e Svago dei mesi già
-  // pianificati si trascinano sul mese successivo
-  function carryFor(targetMonth) {
-    const out = { spesa: 0, svago: 0 }
-    const planned = budgets.filter(b => b.year === YEAR && b.month < targetMonth).sort((a, b) => a.month - b.month)
-    for (const b of planned) {
-      const ex = expenses.filter(e => e.month === b.month && e.year === YEAR)
-      const sp = { spesa: 0, svago: 0 }
-      for (const e of ex) { const k = bucketOf(e); if (sp[k] !== undefined) sp[k] += +e.amount || 0 }
-      out.spesa += (+b.spesa || 0) - sp.spesa
-      out.svago += (+b.svago || 0) - sp.svago
-    }
-    return out
-  }
-  const carryover = useMemo(() => carryFor(month), [budgets, expenses, month])
+  // pianificati si trascinano sul mese successivo, anche a cavallo d'anno
+  const carryover = useMemo(() => carryFor(budgets, expenses, selYear, month), [budgets, expenses, month, selYear])
 
   // rinnovo automatico: a inizio mese copia il piano più recente (il riporto fa il resto)
   useEffect(() => {
     if (!loaded || !uid) return
     const M = now.getMonth()
     if (budgets.some(b => b.month === M && b.year === YEAR)) return
-    const prev = budgets.filter(b => b.year === YEAR && b.month < M).sort((a, b) => b.month - a.month)[0]
+    const curP = pidx(YEAR, M)
+    const prev = budgets.filter(b => pidx(b.year, b.month) < curP)
+      .sort((a, b) => pidx(b.year, b.month) - pidx(a.year, a.month))[0]
     if (!prev) return
     supabase.from('budgets').insert({
       user_id: uid, month: M, year: YEAR, ricorrenti: prev.ricorrenti, spesa: prev.spesa,
@@ -1758,9 +1854,9 @@ export default function App() {
   // ── Contesto finanziario per l'AI ──
   function buildContext() {
     const M = now.getMonth()
-    const mExp = expenses.filter(e => e.month === M && e.year === YEAR)
+    const mExp = inPeriod(expenses, YEAR, M)
     const sp = sum(mExp)
-    const inc = salary + sum(incomes.filter(i => i.month === M && i.year === YEAR))
+    const inc = salary + sum(inPeriod(incomes, YEAR, M))
     const pct = inc > 0 ? Math.round((sp / inc) * 100) : 0
     const perCat = cats
       .map(c => ({ n: c.name, v: sum(mExp.filter(e => String(e.cat_id) === c.id)) }))
@@ -1773,9 +1869,8 @@ export default function App() {
     const bud = budgets.find(b => b.month === M && b.year === YEAR)
     let bucketTxt = 'Nessun piano di gestione attivo questo mese.'
     if (bud) {
-      const sb = { ricorrenti: 0, spesa: 0, svago: 0 }
-      for (const e of mExp) sb[bucketOf(e)] += +e.amount || 0
-      const cf = carryFor(M)
+      const sb = spentByBucket(mExp)
+      const cf = carryFor(budgets, expenses, YEAR, M)
       const resS = Math.round((+bud.spesa || 0) + cf.spesa - sb.spesa)
       const resV = Math.round((+bud.svago || 0) + cf.svago - sb.svago)
       bucketTxt = `Piano di gestione del mese: ricorrenti previste ${Math.round(bud.ricorrenti)}€ (spese finora ${Math.round(sb.ricorrenti)}€); busta Spesa residuo ${resS}€ (budget ${Math.round(bud.spesa)}€${Math.round(cf.spesa) ? `, riporto ${Math.round(cf.spesa)}€` : ''}); busta Svago residuo ${resV}€ (budget ${Math.round(bud.svago)}€${Math.round(cf.svago) ? `, riporto ${Math.round(cf.svago)}€` : ''}); salvadanaio ${Math.round(bud.salvadanaio)}€ ${bud.salvadanaio_done ? 'già accantonato' : 'ancora da accantonare'}.`
@@ -1785,45 +1880,64 @@ export default function App() {
 
   // ── Feature 1: insight proattivo (cache sessionStorage per giorno) ──
   useEffect(() => {
-    if (!loaded || !session) return
+    if (!loaded || !session || !aiConsent) return
     const key = 'spendiq-insight-' + new Date().toISOString().slice(0, 10)
     const cached = sessionStorage.getItem(key)
     if (cached) { try { setInsight(JSON.parse(cached)) } catch { } return }
     if (!expenses.length) return
     const prompt = `${buildContext()}\nSei un coach finanziario proattivo. Genera UN SOLO insight specifico e utile basato su questi dati (max 25 parole, italiano, tono diretto — es. "Sei al 78% del budget svago e siamo solo al 15 del mese").\nRispondi SOLO con JSON: {"text":"...","severity":"ok"}\nseverity: "ok" se va tutto bene, "warn" se serve attenzione, "alert" se la situazione è critica.`
-    askAI(prompt, 200).then(t => {
+    callAI('insight', prompt).then(t => {
       const ins = aiJSON(t, null)
       if (ins?.text) { setInsight(ins); sessionStorage.setItem(key, JSON.stringify(ins)) }
     }).catch(() => { })
+  }, [loaded, aiConsent])
+
+  // ── AI: ogni chiamata passa da qui. Senza consenso si apre la richiesta di attivazione. ──
+  async function ai(task, input) {
+    if (!aiConsent) {
+      setConsentOpen(true)
+      throw new AIError('consent_required', 'Per usare questa funzione attiva prima il coach AI.')
+    }
+    return callAI(task, input)
+  }
+
+  // alla prima apertura dopo il login, proponi una volta l'attivazione del coach AI
+  useEffect(() => {
+    if (!loaded || aiConsent) return
+    try {
+      if (localStorage.getItem('spendiq-ai-consent-asked')) return
+      localStorage.setItem('spendiq-ai-consent-asked', '1')
+    } catch { }
+    setConsentOpen(true)
   }, [loaded])
 
   // ── Feature 3: report mensile ──
-  const prevM = (now.getMonth() + 11) % 12
-  const prevMYear = now.getMonth() === 0 ? YEAR - 1 : YEAR
-  const reportSeenKey = `spendiq-report-${prevMYear}-${prevM}`
+  const prevP = prevPeriod(YEAR, now.getMonth()) // mese appena concluso (a gennaio: dicembre dell'anno prima)
+  const reportSeenKey = `spendiq-report-${prevP.year}-${prevP.month}`
   const showReportBanner = loaded && !reportBannerGone && now.getDate() <= 5 &&
-    !localStorage.getItem(reportSeenKey) && prevMYear === YEAR &&
-    expenses.some(e => e.month === prevM && e.year === YEAR)
+    !localStorage.getItem(reportSeenKey) &&
+    inPeriod(expenses, prevP.year, prevP.month).length > 0
 
-  function statsFor(m) {
-    if (m < 0) return null
-    const ex = expenses.filter(e => e.month === m && e.year === YEAR)
+  function statsFor(y, m) {
+    const ex = inPeriod(expenses, y, m)
     if (!ex.length) return null
-    const inc = salary + sum(incomes.filter(i => i.month === m && i.year === YEAR))
+    const inc = salary + sum(inPeriod(incomes, y, m))
     const per = cats.map(c => ({ n: c.name, v: sum(ex.filter(e => String(e.cat_id) === c.id)) }))
       .filter(x => x.v > 0).map(x => `${x.n} ${Math.round(x.v)}€`).join(', ')
     return `entrate ${Math.round(inc)}€, spese totali ${Math.round(sum(ex))}€ (${per})`
   }
 
-  async function genReport(m) {
-    setReport({ loading: true, month: m })
-    const cur = statsFor(m)
-    const prev = statsFor(m - 1)
-    if (!cur) { setReport({ loading: false, month: m, data: { summary: `Nessuna spesa registrata a ${MONTHS[m]}: non c'è nulla da analizzare.`, wins: [], warnings: [], advice: 'Registra le tue spese per ottenere report utili.' } }); return }
-    const prompt = `Sei un coach finanziario diretto e concreto. Analizza il mese di ${MONTHS[m]} ${YEAR} per questo utente.\n${MONTHS[m]}: ${cur}.\n${m > 0 && prev ? `Mese precedente (${MONTHS[m - 1]}): ${prev}. Confronta i due mesi.` : 'Nessun dato del mese precedente.'}\nObiettivi attivi: ${goals.map(g => g.name).join(', ') || 'nessuno'}.\nRispondi SOLO con JSON: {"summary":"sintesi in 2 frasi","wins":["2-3 cose andate bene"],"warnings":["1-2 aree di attenzione"],"advice":"un consiglio concreto per il mese prossimo"}`
-    const data = aiJSON(await askAI(prompt, 700).catch(() => ''), null)
-    setReport({ loading: false, month: m, data })
-    if (m === prevM) { localStorage.setItem(reportSeenKey, '1'); setReportBannerGone(true) }
+  async function genReport(y, m) {
+    setReport({ loading: true, month: m, year: y })
+    const cur = statsFor(y, m)
+    const pp = prevPeriod(y, m)
+    const prev = statsFor(pp.year, pp.month)
+    if (!cur) { setReport({ loading: false, month: m, year: y, data: { summary: `Nessuna spesa registrata a ${MONTHS[m]} ${y}: non c'è nulla da analizzare.`, wins: [], warnings: [], advice: 'Registra le tue spese per ottenere report utili.' } }); return }
+    const prompt = `Sei un coach finanziario diretto e concreto. Analizza il mese di ${MONTHS[m]} ${y} per questo utente.\n${MONTHS[m]}: ${cur}.\n${prev ? `Mese precedente (${MONTHS[pp.month]} ${pp.year}): ${prev}. Confronta i due mesi.` : 'Nessun dato del mese precedente.'}\nObiettivi attivi: ${goals.map(g => g.name).join(', ') || 'nessuno'}.\nRispondi SOLO con JSON: {"summary":"sintesi in 2 frasi","wins":["2-3 cose andate bene"],"warnings":["1-2 aree di attenzione"],"advice":"un consiglio concreto per il mese prossimo"}`
+    let data = null, error = ''
+    try { data = aiJSON(await ai('report', prompt), null) } catch (e) { error = aiErrorText(e) }
+    setReport({ loading: false, month: m, year: y, data, error })
+    if (data && y === prevP.year && m === prevP.month) { localStorage.setItem(reportSeenKey, '1'); setReportBannerGone(true) }
   }
 
   // ── AI: analisi obiettivo ──
@@ -1831,7 +1945,7 @@ export default function App() {
     const d = new Date(form.deadline)
     const monthsLeft = Math.max(1, (d.getFullYear() - now.getFullYear()) * 12 + (d.getMonth() - now.getMonth()))
     const prompt = `${buildContext()}\nMargine mensile stimato (entrate - spesa media): ${Math.round(margin)}€.\nL'utente vuole questo obiettivo: "${form.name}", target ${parseAmount(form.target)}€, già risparmiati ${parseAmount(form.saved) || 0}€, scadenza ${form.deadline} (${monthsLeft} mesi rimanenti).\nCalcola la quota mensile necessaria (numero). Valuta se è raggiungibile con il margine attuale. Dai UN consiglio specifico e concreto su quale categoria di spesa reale tagliare e di quanto per sostenere il piano (max 40 parole, italiano).\nRispondi SOLO con JSON: {"raggiungibile":true,"mensile":250,"consiglio":"..."}`
-    try { return aiJSON(await askAI(prompt, 400), null) } catch { return null }
+    try { return aiJSON(await ai('goal', prompt), null) } catch { return null }
   }
 
   // ── AI: divide il disponibile (entrate − ricorrenti − salvadanaio) tra Spesa e Svago
@@ -1839,10 +1953,10 @@ export default function App() {
   async function generatePlan(salv) {
     const disp = Math.round(totalIncome - estRic - salv)
     // analisi del mese precedente rispetto al mese del piano
-    const pm = month - 1
-    const pex = pm >= 0 ? expenses.filter(e => e.month === pm && e.year === YEAR) : []
-    const psp = { ricorrenti: 0, spesa: 0, svago: 0 }
-    for (const e of pex) psp[bucketOf(e)] += +e.amount || 0
+    const pp = prevPeriod(selYear, month)
+    const pm = pp.month
+    const pex = inPeriod(expenses, pp.year, pp.month)
+    const psp = spentByBucket(pex)
     const svagoDet = cats
       .map(c => ({ n: c.name, v: sum(pex.filter(e => String(e.cat_id) === c.id && bucketOf(e) === 'svago')) }))
       .filter(x => x.v > 0).sort((a, b) => b.v - a.v).slice(0, 5)
@@ -1855,11 +1969,11 @@ ${prevTxt}
 L'utente vuole mettere da parte ${Math.round(salv)}€ questo mese. Entrate ${Math.round(totalIncome)}€, spese ricorrenti fisse ${Math.round(estRic)}€: restano ${disp}€ da dividere SOLO tra le buste "spesa" (supermercato/alimentari per casa) e "svago" (tutto il resto: ristoranti, uscite, shopping…).
 Proponi una divisione realistica basata su come ha speso il mese scorso; la somma spesa+svago deve essere ≤ ${disp}. Se il mese scorso ha speso più del disponibile attuale, dillo chiaramente nel consiglio. Aggiungi UN consiglio pratico (max 30 parole, italiano, tono diretto).
 Rispondi SOLO con JSON: {"spesa":300,"svago":300,"consiglio":"..."}`
-    try { return aiJSON(await askAI(prompt, 300), null) } catch { return null }
+    try { return aiJSON(await ai('plan', prompt), null) } catch { return null }
   }
 
   async function saveBudget(vals) {
-    const existing = budgets.find(b => b.month === month && b.year === YEAR)
+    const existing = budgets.find(b => b.month === month && b.year === selYear)
     if (existing) {
       const { data, error } = await supabase.from('budgets').update(vals).eq('id', existing.id).select().single()
       if (error) { window.alert('Impossibile salvare il piano: ' + error.message); return false }
@@ -1867,7 +1981,7 @@ Rispondi SOLO con JSON: {"spesa":300,"svago":300,"consiglio":"..."}`
       return true
     }
     const { data, error } = await supabase.from('budgets')
-      .insert({ user_id: uid, month, year: YEAR, ...vals }).select().single()
+      .insert({ user_id: uid, month, year: selYear, ...vals }).select().single()
     if (error) {
       window.alert('Impossibile salvare il piano. Se è la prima volta, esegui migration-buckets.sql nell\'SQL Editor di Supabase.')
       return false
@@ -1909,7 +2023,7 @@ Per ogni transazione scegli categoria e sottocategoria più adatte, più:
 - "ric": true SOLO se è chiaramente un abbonamento o costo fisso mensile (Netflix, Spotify, palestra, telefono, assicurazione, affitto…).
 Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa","ric":false}]`
       try {
-        const res = aiJSON(await askAI(prompt, 2200), [])
+        const res = aiJSON(await ai('categorize', prompt), [])
         for (const r of res || []) {
           const t = batch[r.i]
           const c = cats.find(x => x.id === String(r.cat))
@@ -1919,7 +2033,10 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
             t.ric = !!r.ric
           }
         }
-      } catch { }
+      } catch (e) {
+        // consenso mancante, limite raggiunto o sessione scaduta: inutile proseguire con gli altri lotti
+        if (e instanceof AIError && ['consent_required', 'rate_limited', 'unauthorized'].includes(e.code)) throw e
+      }
     }
     return txs.map(t => ({
       ...t, catId: t.catId || '3', sub: t.sub || 'Shopping',
@@ -1949,7 +2066,7 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
     // il mese/anno della spesa seguono la data scelta
     const d = f.tx_date ? new Date(f.tx_date + 'T00:00:00') : null
     const expMonth = d && !isNaN(d) ? d.getMonth() : month
-    const expYear = d && !isNaN(d) ? d.getFullYear() : YEAR
+    const expYear = d && !isNaN(d) ? d.getFullYear() : selYear
     if (f.id) {
       let patch = { cat_id: f.cat_id, sub: f.sub, amount: f.amount, note: f.note, tx_date: f.tx_date, bucket: f.bucket, month: expMonth, year: expYear }
       let { data, error } = await supabase.from('expenses').update(patch).eq('id', f.id).select().single()
@@ -1961,7 +2078,7 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
         const { tx_date, ...p3 } = patch
         ;({ data } = await supabase.from('expenses').update(p3).eq('id', f.id).select().single())
       }
-      if (data) setExpenses(prev => prev.map(e => e.id === f.id ? data : e).filter(e => e.year === YEAR))
+      if (data) setExpenses(prev => prev.map(e => e.id === f.id ? data : e))
     } else {
       let recurringId = null
       if (f.recurring) {
@@ -1975,7 +2092,7 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
         tx_date: f.tx_date, month: expMonth, year: expYear, recurring_id: recurringId,
         bucket: f.bucket || guessBucket(f.cat_id, f.sub, !!recurringId),
       }])
-      if (data) setExpenses(prev => [...prev, ...data.filter(e => e.year === YEAR)])
+      if (data) setExpenses(prev => [...prev, ...data])
     }
   }
 
@@ -1991,7 +2108,7 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
 
   async function addIncome(amount, note) {
     const { data } = await supabase.from('incomes')
-      .insert({ user_id: uid, amount, note, month, year: YEAR }).select().single()
+      .insert({ user_id: uid, amount, note, month, year: selYear }).select().single()
     if (data) setIncomes(prev => [...prev, data])
   }
 
@@ -2049,29 +2166,85 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
       bucket: t.bucket || guessBucket(t.catId, t.sub, false),
     }))
     const data = await insertExpenseRows(rows)
-    if (data) setExpenses(prev => [...prev, ...data.filter(e => e.year === YEAR)])
+    if (data) setExpenses(prev => [...prev, ...data])
     // le transazioni flaggate come abbonamento dall'AI entrano tra i candidati ricorrenti
     const flags = txs.filter(t => t.ric).map(t => ricKey({ note: t.desc, sub: t.sub })).filter(Boolean)
     if (flags.length) setAiFlagged(prev => [...new Set([...prev, ...flags])])
   }
 
+  // ── Account: consenso AI, esportazione, eliminazione ──
+  async function setAIConsent(on) {
+    const { error } = await supabase.from('profiles')
+      .upsert({ id: uid, ai_consent_at: on ? new Date().toISOString() : null })
+    if (error) throw error
+    setAiConsent(on)
+    if (!on) { setInsight(null); setChatOpen(false) }
+  }
+
+  async function exportData() {
+    const data = await exportUserData(session.user)
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }))
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `spendiq-dati-${isoDate(new Date())}.json`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  }
+
+  function clearLocalData() {
+    try {
+      for (const store of [localStorage, sessionStorage]) {
+        Object.keys(store).filter(k => k.startsWith('spendiq-')).forEach(k => store.removeItem(k))
+      }
+    } catch { }
+  }
+
+  async function deleteAccount() {
+    const { error } = await supabase.functions.invoke('delete-account', { body: { confirm: 'ELIMINA' } })
+    if (error) throw error
+    clearLocalData()
+    // l'utente non esiste più sul server: basta chiudere la sessione locale
+    await supabase.auth.signOut({ scope: 'local' })
+  }
+
   // ── Render ──
-  if (session === undefined) {
+  const spinner = (
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div className="spin" role="status" aria-label="Caricamento" style={{ width: 30, height: 30, border: `3px solid ${P.ink5}`, borderTopColor: P.blue, borderRadius: '50%' }} />
+    </div>
+  )
+  if (session === undefined) return spinner
+  if (!session) return <AuthScreen />
+  if (loadError) {
     return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        <div className="spin" style={{ width: 30, height: 30, border: `3px solid ${P.ink5}`, borderTopColor: P.blue, borderRadius: '50%' }} />
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+        <Card style={{ maxWidth: 380, textAlign: 'center', padding: 24 }}>
+          <Icon name="alert" size={28} color={P.amber} style={{ margin: '0 auto 10px' }} />
+          <div style={{ fontWeight: 700, fontSize: 16 }}>Non riesco a caricare i tuoi dati</div>
+          <div style={{ fontSize: 13.5, color: P.ink3, margin: '6px 0 16px', lineHeight: 1.5 }}>
+            Controlla la connessione e riprova. I tuoi dati sono al sicuro: non è stato modificato nulla.
+          </div>
+          <Btn onClick={() => loadAll(uid)} style={{ width: '100%' }}>Riprova</Btn>
+          <Btn variant="ghost" onClick={() => supabase.auth.signOut()} style={{ width: '100%', marginTop: 10 }}>Esci</Btn>
+        </Card>
       </div>
     )
   }
-  if (!session) return <AuthScreen />
+  if (!loaded) return spinner
 
-  // dati grafici
-  const trendData = []
-  for (let i = 5; i >= 0; i--) {
-    const m = month - i
-    if (m < 0) { trendData.push({ name: MONTHS_S[(m + 12) % 12], v: 0 }); continue }
-    trendData.push({ name: MONTHS_S[m], v: Math.round(sum(expenses.filter(e => e.month === m && e.year === YEAR)) * 100) / 100 })
-  }
+  // etichetta del periodo visualizzato: l'anno compare solo se non è quello corrente
+  const periodLabel = MONTHS[month] + (selYear !== YEAR ? ` ${selYear}` : '')
+  const isCurrentPeriod = month === now.getMonth() && selYear === YEAR
+  // anni selezionabili: dal più vecchio con dati fino a oggi
+  const minYear = [...expenses, ...incomes, ...budgets].reduce((m, r) => (r.year < m ? r.year : m), YEAR)
+
+  // dati grafici: ultimi 6 mesi fino a quello visualizzato, anche a cavallo d'anno
+  const trendData = lastPeriods(selYear, month, 6).map(p => ({
+    name: MONTHS_S[p.month],
+    v: Math.round(sum(inPeriod(expenses, p.year, p.month)) * 100) / 100,
+  }))
   const pieData = byCat.filter(c => c.total > 0)
   const pct = totalIncome > 0 ? Math.min(100, (spent / totalIncome) * 100) : (spent > 0 ? 100 : 0)
   const barColor = pct > 90 ? P.red : pct > 70 ? P.amber : P.blue
@@ -2126,6 +2299,20 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
         {/* ── DASHBOARD ── */}
         {view.name === 'dash' && (
           <div className="fadeUp">
+            {/* selettore anno: compare solo se esistono dati di anni precedenti */}
+            {minYear < YEAR && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 14, padding: '12px 16px 0' }}>
+                <button aria-label="Anno precedente" disabled={selYear <= minYear} onClick={() => setSelYear(selYear - 1)} style={{
+                  background: P.white, border: `1px solid ${P.ink5}`, borderRadius: 10, width: 36, height: 36, cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: selYear <= minYear ? 0.35 : 1,
+                }}><Icon name="back" size={16} /></button>
+                <span style={{ fontSize: 15, fontWeight: 700, minWidth: 48, textAlign: 'center' }}>{selYear}</span>
+                <button aria-label="Anno successivo" disabled={selYear >= YEAR} onClick={() => setSelYear(selYear + 1)} style={{
+                  background: P.white, border: `1px solid ${P.ink5}`, borderRadius: 10, width: 36, height: 36, cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: selYear >= YEAR ? 0.35 : 1,
+                }}><Icon name="back" size={16} style={{ transform: 'rotate(180deg)' }} /></button>
+              </div>
+            )}
             {/* barra mesi */}
             <div className="hscroll" style={{ display: 'flex', gap: 6, padding: '12px 16px 2px' }}>
               {MONTHS_S.map((m, i) => (
@@ -2163,9 +2350,9 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
                 }}>
                   <Icon name="chart" size={17} color={P.blue} />
                   <div style={{ flex: 1, fontSize: 13.5, color: P.ink2 }}>
-                    {MONTHS[prevM]} è finito: vuoi il check del mese?
+                    {MONTHS[prevP.month]} è finito: vuoi il check del mese?
                   </div>
-                  <Btn small onClick={() => genReport(prevM)}>Vedi report</Btn>
+                  <Btn small onClick={() => genReport(prevP.year, prevP.month)}>Vedi report</Btn>
                   <span onClick={() => { localStorage.setItem(reportSeenKey, '1'); setReportBannerGone(true) }}
                     style={{ cursor: 'pointer', display: 'flex', padding: 2 }}>
                     <Icon name="x" size={14} color={P.ink3} />
@@ -2193,7 +2380,7 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
               {/* Hero card */}
               <Card style={{ padding: 20 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.08em', color: P.ink3 }}>
-                  Speso a {MONTHS[month]}
+                  Speso a {periodLabel}
                 </div>
                 <div style={{ fontSize: 36, fontWeight: 700, letterSpacing: '-1.5px', margin: '4px 0 2px' }}>
                   {fmt(spent)}
@@ -2237,7 +2424,7 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
 
               {/* Piano di gestione: Spesa, Svago, Salvadanaio — sempre visibile */}
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', margin: '20px 0 8px' }}>
-                <SLabel style={{ margin: 0 }}>Piano di {MONTHS[month]}</SLabel>
+                <SLabel style={{ margin: 0 }}>Piano di {periodLabel}</SLabel>
                 {curBudget ? (
                   <button onClick={() => setPlanOpen(true)} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4, display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, fontWeight: 600, color: P.blue }}>
                     <Icon name="pencil" size={13} color={P.blue} /> Modifica
@@ -2324,7 +2511,7 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
                       <span style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12.5, fontWeight: 600, color: P.green }}>
                         <Icon name="check" size={15} color={P.green} /> Accantonato
                       </span>
-                    ) : month === now.getMonth() ? (
+                    ) : isCurrentPeriod ? (
                       <Btn small variant="ghost" onClick={confirmSalvadanaio}>
                         <Icon name="check" size={14} color={P.green} /> Metti da parte
                       </Btn>
@@ -2375,8 +2562,8 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
               )}
 
               {/* Report on-demand */}
-              <Btn variant="ghost" onClick={() => genReport(month)} style={{ width: '100%', marginTop: 12 }}>
-                <Icon name="spark" size={15} color={P.blue} /> Report di {MONTHS[month]}
+              <Btn variant="ghost" onClick={() => genReport(selYear, month)} style={{ width: '100%', marginTop: 12 }}>
+                <Icon name="spark" size={15} color={P.blue} /> Report di {periodLabel}
               </Btn>
 
               {/* Andamento 6 mesi */}
@@ -2447,7 +2634,7 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
               <SLabel>Transazioni principali</SLabel>
               {recentTx.length === 0 && (
                 <Card style={{ color: P.ink3, fontSize: 13.5, textAlign: 'center' }}>
-                  Nessuna spesa a {MONTHS[month]}. Aggiungine una col pulsante +.
+                  Nessuna spesa a {periodLabel}. Aggiungine una col pulsante +.
                 </Card>
               )}
               {recentTx.map(e => {
@@ -2501,7 +2688,7 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
                 </div>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 17, fontWeight: 700, letterSpacing: '-0.3px' }}>{cat.name}</div>
-                  <div style={{ fontSize: 12.5, color: P.ink3 }}>{MONTHS[month]}</div>
+                  <div style={{ fontSize: 12.5, color: P.ink3 }}>{periodLabel}</div>
                 </div>
                 <div style={{ fontSize: 20, fontWeight: 700, letterSpacing: '-0.6px' }}>{fmt(catTotal)}</div>
               </div>
@@ -2519,7 +2706,7 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
               )}
 
               {catExp.length === 0 && (
-                <Card style={{ color: P.ink3, fontSize: 13.5, textAlign: 'center' }}>Nessuna spesa in questa categoria a {MONTHS[month]}.</Card>
+                <Card style={{ color: P.ink3, fontSize: 13.5, textAlign: 'center' }}>Nessuna spesa in questa categoria a {periodLabel}.</Card>
               )}
               {[...catExp].sort((a, b) => b.amount - a.amount).map(e => (
                 <Card key={e.id} style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '12px 14px', marginBottom: 8 }}>
@@ -2556,20 +2743,25 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
 
         {/* ── GESTIONE ── */}
         {view.name === 'manage' && (
-          <ManageView cats={cats} customCats={customCats} monthExp={monthExp} month={month}
+          <ManageView cats={cats} customCats={customCats} monthExp={monthExp} month={month} year={selYear}
             recurring={recurring} incomes={incomes} monthIncomes={monthIncomes}
             salary={salary} totalIncome={totalIncome}
             onEditExpense={e => setExpenseModal({ expense: e })} onDeleteExpense={deleteExpense}
             onToggleRecurring={toggleRecurring} onDeleteRecurring={deleteRecurring}
             onAddIncome={addIncome} onDeleteIncome={deleteIncome}
             onAddCategory={addCategory} onDeleteCategory={deleteCategory}
-            onUpdateCatSubs={updateCatSubs} onOpenSalary={() => setSalaryOpen(true)} />
+            onUpdateCatSubs={updateCatSubs} onOpenSalary={() => setSalaryOpen(true)}
+            account={{
+              email: session.user.email, aiConsent,
+              onEnableAI: () => setConsentOpen(true), onDisableAI: () => setAIConsent(false),
+              onExport: exportData, onDeleteAccount: deleteAccount, onLogout: () => supabase.auth.signOut(),
+            }} />
         )}
       </div>
 
       {/* FAB chat */}
       {!chatOpen && (
-        <button onClick={() => setChatOpen(true)} style={{
+        <button aria-label="Apri la chat con il coach AI" onClick={() => (aiConsent ? setChatOpen(true) : setConsentOpen(true))} style={{
           position: 'fixed', right: 16, bottom: 96, zIndex: 80,
           width: 52, height: 52, borderRadius: '50%', background: P.ink, border: 'none', cursor: 'pointer',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -2578,7 +2770,7 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
           <Icon name="chat" size={22} color="#fff" />
         </button>
       )}
-      <ChatPanel open={chatOpen} onClose={() => setChatOpen(false)} buildContext={buildContext} />
+      <ChatPanel open={chatOpen} onClose={() => setChatOpen(false)} buildContext={buildContext} ask={ai} />
 
       {/* Bottom nav */}
       <div style={{
@@ -2611,7 +2803,7 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
       {/* Modali */}
       {expenseModal && (
         <ExpenseModal cats={cats} initial={expenseModal.expense || (expenseModal.catId ? { catId: expenseModal.catId } : null)}
-          defaultDate={month === now.getMonth() ? isoDate(now) : `${YEAR}-${String(month + 1).padStart(2, '0')}-01`}
+          defaultDate={isCurrentPeriod ? isoDate(now) : `${selYear}-${String(month + 1).padStart(2, '0')}-01`}
           onSave={saveExpense} onClose={() => setExpenseModal(null)} />
       )}
       {salaryOpen && <SalaryModal salary={salary} onSave={saveSalary} onClose={() => setSalaryOpen(false)}
@@ -2619,10 +2811,11 @@ Rispondi SOLO con JSON array: [{"i":0,"cat":"1","sub":"Supermercato","b":"spesa"
       {incomeOpen && <IncomeModal month={month} onSave={addIncome} onClose={() => setIncomeOpen(false)} />}
       {report && <ReportModal report={report} onClose={() => setReport(null)} />}
       {planOpen && (
-        <PlanModal monthName={MONTHS[month]} income={totalIncome} estRic={estRic}
+        <PlanModal monthName={periodLabel} income={totalIncome} estRic={estRic}
           goalHint={totGoalQuota} existing={curBudget}
           onGenerate={generatePlan} onSave={saveBudget} onClose={() => setPlanOpen(false)} />
       )}
+      {consentOpen && <AIConsentModal onAccept={() => setAIConsent(true)} onClose={() => setConsentOpen(false)} />}
       {ricOpen && ricCands.length > 0 && (
         <RicSuggestModal candidates={ricCands} cats={cats}
           onConfirm={confirmRic} onDismiss={dismissRic} onClose={() => setRicOpen(false)} />

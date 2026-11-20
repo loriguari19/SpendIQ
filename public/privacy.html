@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Informativa privacy · SpendIQ</title>
+  <style>
+    body { margin: 0; background: #F6F6F9; color: #0F0F14; font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; }
+    main { max-width: 720px; margin: 0 auto; padding: 24px 16px 64px; }
+    h1 { font-size: 26px; letter-spacing: -0.5px; margin: 8px 0 4px; }
+    h2 { font-size: 18px; margin: 32px 0 8px; }
+    p, li { font-size: 15px; color: #3A3A4A; }
+    a { color: #2563EB; }
+    table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
+    th, td { text-align: left; padding: 8px 10px; border: 1px solid #E2E2E8; vertical-align: top; color: #3A3A4A; }
+    th { background: #EEEEF2; color: #0F0F14; }
+    .draft { background: #FFFBEB; border: 1px solid #F3D38A; border-radius: 12px; padding: 12px 14px; font-size: 14px; color: #6B4A05; }
+    .todo { background: #FEF2F2; color: #B91C1C; border-radius: 4px; padding: 0 4px; font-weight: 600; }
+    .meta { font-size: 13px; color: #5F5F70; }
+    .wrap { overflow-x: auto; }
+  </style>
+</head>
+<body>
+<main>
+  <p><a href="/">← Torna a SpendIQ</a></p>
+
+  <!-- RIMUOVERE questo riquadro quando il documento è completo e verificato -->
+  <div class="draft">
+    <strong>Bozza.</strong> Questo testo descrive come funziona oggi l'app, ma va completato nei punti
+    evidenziati in rosso e fatto verificare da un legale prima di aprire il servizio al pubblico.
+  </div>
+
+  <h1>Informativa sul trattamento dei dati personali</h1>
+  <p class="meta">Versione del 16 novembre 2026 · ai sensi degli artt. 13 e 14 del Regolamento (UE) 2016/679 (GDPR)</p>
+
+  <h2>1. Chi tratta i tuoi dati</h2>
+  <p>
+    Il titolare del trattamento è <span class="todo">[NOME E COGNOME o RAGIONE SOCIALE, INDIRIZZO, P.IVA/C.F.]</span>.
+    Per qualsiasi richiesta sui tuoi dati puoi scrivere a <span class="todo">[EMAIL DI CONTATTO PRIVACY]</span>.
+  </p>
+
+  <h2>2. Quali dati trattiamo</h2>
+  <ul>
+    <li><strong>Dati dell'account:</strong> indirizzo email e password. La password è gestita dal servizio di autenticazione e conservata in forma cifrata (hash): non possiamo leggerla.</li>
+    <li><strong>Dati finanziari che inserisci tu:</strong> stipendio, entrate, spese (importo, data, categoria, note), spese ricorrenti, obiettivi di risparmio, categorie personalizzate e piani mensili.</li>
+    <li><strong>Estratti conto:</strong> il file PDF o Excel che scegli viene letto direttamente sul tuo dispositivo e non viene caricato sui nostri server. Vengono salvate solo le transazioni che decidi di importare.</li>
+    <li><strong>Messaggi al coach AI:</strong> le domande che scrivi in chat vengono inviate al fornitore del modello AI per generare la risposta. SpendIQ non le salva nel proprio database.</li>
+    <li><strong>Dati tecnici:</strong> indirizzo IP, data e ora delle richieste e informazioni sul browser, registrati dai fornitori di hosting per far funzionare e proteggere il servizio; il numero giornaliero di richieste al coach AI, per prevenire abusi.</li>
+    <li><strong>Dati salvati sul dispositivo:</strong> la sessione di accesso e alcune preferenze sono conservate nella memoria del browser (localStorage). Non usiamo cookie di profilazione né strumenti pubblicitari.</li>
+  </ul>
+  <p>
+    Le descrizioni delle spese possono rivelare indirettamente informazioni delicate (per esempio spese mediche).
+    Sei tu a decidere cosa registrare: ti invitiamo a non inserire nelle note informazioni non necessarie.
+  </p>
+
+  <h2>3. Perché li trattiamo e su quale base</h2>
+  <div class="wrap">
+  <table>
+    <tr><th>Finalità</th><th>Base giuridica</th></tr>
+    <tr><td>Creare e gestire l'account, salvare e mostrarti spese, entrate, obiettivi e piani</td><td>Esecuzione del contratto (art. 6.1.b GDPR)</td></tr>
+    <tr><td>Funzioni del coach AI: insight, report mensili, piani, analisi degli obiettivi, categorizzazione automatica, chat</td><td>Il tuo consenso (art. 6.1.a GDPR), che dai attivando il coach e puoi revocare in ogni momento da Gestione → Account</td></tr>
+    <tr><td>Sicurezza del servizio e prevenzione degli abusi (per esempio il limite giornaliero di richieste AI)</td><td>Legittimo interesse (art. 6.1.f GDPR)</td></tr>
+    <tr><td>Adempimento di obblighi di legge e risposta alle richieste delle autorità</td><td>Obbligo legale (art. 6.1.c GDPR)</td></tr>
+  </table>
+  </div>
+  <p>Non vendiamo i tuoi dati e non li usiamo per pubblicità o profilazione commerciale.</p>
+
+  <h2>4. Il coach AI</h2>
+  <p>
+    Se attivi il coach AI, per ogni richiesta inviamo al fornitore del modello (Anthropic) solo ciò che serve a rispondere:
+    i totali di entrate e spese e la loro suddivisione per categoria, il piano del mese, nomi, importi e scadenze
+    dei tuoi obiettivi, le descrizioni delle transazioni che importi e il testo delle tue domande.
+    Non inviamo email, password o altri dati di accesso.
+  </p>
+  <p>
+    Le risposte del coach sono generate automaticamente, possono contenere errori e hanno valore puramente informativo:
+    non costituiscono consulenza finanziaria, fiscale o in materia di investimenti. SpendIQ non prende decisioni
+    automatizzate che producono effetti giuridici nei tuoi confronti.
+  </p>
+  <p>Se non attivi il coach, o lo disattivi, nessun dato viene inviato al fornitore AI e il resto dell'app continua a funzionare.</p>
+
+  <h2>5. A chi comunichiamo i dati</h2>
+  <p>Ci serviamo di fornitori che trattano i dati per nostro conto, come responsabili del trattamento:</p>
+  <div class="wrap">
+  <table>
+    <tr><th>Fornitore</th><th>A cosa serve</th><th>Dove</th></tr>
+    <tr><td>Supabase</td><td>Database, autenticazione, funzioni server</td><td><span class="todo">[REGIONE DEL PROGETTO SUPABASE, es. UE – Francoforte]</span></td></tr>
+    <tr><td>Anthropic</td><td>Modello AI del coach (solo se attivato)</td><td>Stati Uniti</td></tr>
+    <tr><td><span class="todo">[HOSTING, es. Vercel]</span></td><td>Pubblicazione dell'app web</td><td><span class="todo">[DA VERIFICARE]</span></td></tr>
+    <tr><td>Google (Google Fonts)</td><td>Caricamento del carattere tipografico dell'app; comporta la comunicazione del tuo indirizzo IP</td><td>Stati Uniti / UE</td></tr>
+  </table>
+  </div>
+  <p>
+    Alcuni fornitori si trovano fuori dallo Spazio Economico Europeo. In questi casi il trasferimento avviene sulla base
+    di <span class="todo">[GARANZIE DA VERIFICARE PER OGNI FORNITORE: decisione di adeguatezza / Data Privacy Framework / clausole contrattuali standard]</span>.
+  </p>
+
+  <h2>6. Per quanto tempo li conserviamo</h2>
+  <ul>
+    <li>I dati dell'account e i dati finanziari restano finché l'account è attivo.</li>
+    <li>Quando elimini l'account, i tuoi dati vengono cancellati dal database. Eventuali copie di backup vengono sovrascritte entro <span class="todo">[N GIORNI, secondo il piano Supabase]</span>.</li>
+    <li>I dati inviati al fornitore AI sono conservati da quest'ultimo secondo le proprie condizioni: <span class="todo">[PERIODO DA VERIFICARE NELLE CONDIZIONI COMMERCIALI ANTHROPIC]</span>.</li>
+    <li>I log tecnici sono conservati per <span class="todo">[PERIODO]</span>.</li>
+  </ul>
+
+  <h2>7. I tuoi diritti</h2>
+  <p>Hai diritto di accedere ai tuoi dati, correggerli, cancellarli, limitarne il trattamento, opporti, riceverne una copia in formato leggibile da un computer e revocare il consenso. Molti di questi diritti li eserciti direttamente dall'app, in <strong>Gestione → Account</strong>:</p>
+  <ul>
+    <li><strong>Esporta i miei dati</strong> scarica una copia completa in formato JSON;</li>
+    <li><strong>Coach AI → Disattiva</strong> revoca il consenso all'invio dei dati al fornitore AI;</li>
+    <li><strong>Elimina il mio account</strong> cancella definitivamente account e dati.</li>
+  </ul>
+  <p>
+    Per ogni altra richiesta scrivi a <span class="todo">[EMAIL DI CONTATTO PRIVACY]</span>: rispondiamo entro un mese.
+    Se ritieni che il trattamento violi la normativa puoi presentare reclamo al
+    <a href="https://www.garanteprivacy.it" target="_blank" rel="noopener">Garante per la protezione dei dati personali</a>.
+  </p>
+
+  <h2>8. Minori</h2>
+  <p>SpendIQ è destinato a persone maggiorenni. Non raccogliamo consapevolmente dati di minori di 18 anni.</p>
+
+  <h2>9. Modifiche a questa informativa</h2>
+  <p>Se cambiamo in modo rilevante il modo in cui trattiamo i dati, aggiorniamo questa pagina e te lo segnaliamo nell'app prima che le modifiche abbiano effetto.</p>
+</main>
+</body>
+</html>
